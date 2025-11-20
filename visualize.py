@@ -22,25 +22,20 @@ def visualize_attention(attention_weights_list, frames, save_path=None, layer_id
     if len(attention_weights_list) == 0:
         return
     
-    # Get attention from specified layer
     attn = attention_weights_list[layer_idx][0]  # (num_heads, N, N)
     attn = attn[head_idx].cpu().numpy()  # (N, N)
     
     T, C, H, W = frames.shape
     num_points = attn.shape[0] // T
     
-    # Reshape attention to (T, num_points, T, num_points)
     attn_reshaped = attn.reshape(T, num_points, T, num_points)
     
-    # Average over points dimension to get temporal attention
     temporal_attn = attn_reshaped.mean(axis=(1, 3))  # (T, T)
     
-    # Create figure
     fig, axes = plt.subplots(2, T, figsize=(3*T, 6))
     if T == 1:
         axes = axes.reshape(2, 1)
     
-    # Plot frames
     for t in range(T):
         frame = frames[t].transpose(1, 2, 0)  # (H, W, C)
         frame = np.clip(frame, 0, 1)
@@ -48,14 +43,12 @@ def visualize_attention(attention_weights_list, frames, save_path=None, layer_id
         axes[0, t].set_title(f'Frame {t}')
         axes[0, t].axis('off')
     
-    # Plot attention heatmap
     im = axes[1, 0].imshow(temporal_attn, cmap='hot', aspect='auto')
     axes[1, 0].set_title('Temporal Attention')
     axes[1, 0].set_xlabel('Query Frame')
     axes[1, 0].set_ylabel('Key Frame')
     plt.colorbar(im, ax=axes[1, 0])
     
-    # Hide other subplots in second row
     for t in range(1, T):
         axes[1, t].axis('off')
     
@@ -81,7 +74,6 @@ def visualize_predictions(frames, pred_points, gt_points, initial_points, save_p
     T, C, H, W = frames.shape
     N = pred_points.shape[1]
     
-    # Convert normalized coordinates to pixel coordinates
     pred_pixel = pred_points.copy()
     pred_pixel[:, :, 0] *= W
     pred_pixel[:, :, 1] *= H
@@ -94,13 +86,11 @@ def visualize_predictions(frames, pred_points, gt_points, initial_points, save_p
     initial_pixel[:, 0] *= W
     initial_pixel[:, 1] *= H
     
-    # Create figure with subplots for each frame
     fig, axes = plt.subplots(2, (T + 1) // 2, figsize=(4 * ((T + 1) // 2), 8))
     if T == 1:
         axes = axes.reshape(2, 1)
     axes = axes.flatten()
     
-    # Color map for different points
     colors = plt.cm.tab10(np.linspace(0, 1, N))
     
     for t in range(T):
@@ -109,27 +99,22 @@ def visualize_predictions(frames, pred_points, gt_points, initial_points, save_p
         frame = np.clip(frame, 0, 1)
         ax.imshow(frame)
         
-        # Plot trajectories up to current frame
         for n in range(N):
             color = colors[n]
             
-            # Plot ground truth trajectory
             if t > 0:
                 gt_traj = gt_pixel[:t+1, n, :]
                 ax.plot(gt_traj[:, 0], gt_traj[:, 1], '--', color=color, alpha=0.5, linewidth=1, label=f'GT {n}' if t == 0 else '')
             
-            # Plot predicted trajectory
             if t > 0:
                 pred_traj = pred_pixel[:t+1, n, :]
                 ax.plot(pred_traj[:, 0], pred_traj[:, 1], '-', color=color, linewidth=2, label=f'Pred {n}' if t == 0 else '')
             
-            # Plot current points
             ax.scatter(gt_pixel[t, n, 0], gt_pixel[t, n, 1], 
                       c=[color], marker='o', s=50, edgecolors='white', linewidths=1, label=f'GT {n}' if t == 0 and n == 0 else '')
             ax.scatter(pred_pixel[t, n, 0], pred_pixel[t, n, 1], 
                       c=[color], marker='x', s=100, linewidths=2, label=f'Pred {n}' if t == 0 and n == 0 else '')
         
-        # Plot initial points
         if t == 0:
             for n in range(N):
                 ax.scatter(initial_pixel[n, 0], initial_pixel[n, 1], 
@@ -138,7 +123,6 @@ def visualize_predictions(frames, pred_points, gt_points, initial_points, save_p
         ax.set_title(f'Frame {t}')
         ax.axis('off')
     
-    # Hide unused subplots
     for t in range(T, len(axes)):
         axes[t].axis('off')
     
@@ -194,7 +178,6 @@ def visualize_attention_heads(attention_weights_list, save_path=None, layer_idx=
     attn = attention_weights_list[layer_idx][0]  # (num_heads, N, N)
     num_heads = attn.shape[0]
     
-    # Create grid of subplots
     cols = 4
     rows = (num_heads + cols - 1) // cols
     
@@ -207,7 +190,6 @@ def visualize_attention_heads(attention_weights_list, save_path=None, layer_idx=
         axes[head_idx].set_title(f'Head {head_idx}')
         plt.colorbar(im, ax=axes[head_idx])
     
-    # Hide unused subplots
     for head_idx in range(num_heads, len(axes)):
         axes[head_idx].axis('off')
     

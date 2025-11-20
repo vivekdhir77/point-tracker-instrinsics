@@ -43,14 +43,11 @@ class PointOdysseyDataset(Dataset):
         self.min_frames = min_frames
         self.augment = augment
         
-        # Get video directories
         if video_dirs is None:
-            # Find all video directories
             self.video_dirs = [d.name for d in self.data_root.iterdir() if d.is_dir()]
         else:
             self.video_dirs = video_dirs
         
-        # Store annotation data once per video to avoid duplication
         self.video_annotations = {}
         self.sequences = []
         for video_dir_name in self.video_dirs:
@@ -63,9 +60,8 @@ class PointOdysseyDataset(Dataset):
                 continue
             try:
                 with np.load(anno_path) as anno:
-                    trajs_2d = anno['trajs_2d'].copy()  # (T, N, 2) - copy into memory
-                    visibs = anno['visibs'].copy()  # (T, N) - copy into memory
-                # Store annotation data once per video
+                    trajs_2d = anno['trajs_2d'].copy()  # (T, N, 2)
+                    visibs = anno['visibs'].copy()  # (T, N)
                 self.video_annotations[video_dir_name] = {
                     'trajs_2d': trajs_2d,
                     'visibs': visibs
@@ -86,9 +82,7 @@ class PointOdysseyDataset(Dataset):
                 print(f"Warning: Skipping {video_dir_name} - only {num_frames} frames available")
                 continue
             
-            # Create sequences
             for start_idx in range(num_frames - sequence_length + 1):
-                # Get valid point indices visible at the start frame of this sequence
                 start_frame_visibs = visibs[start_idx]
                 valid_point_indices = [
                     point_idx for point_idx in range(visibs.shape[1])
@@ -96,10 +90,8 @@ class PointOdysseyDataset(Dataset):
                 ]
                 
                 if len(valid_point_indices) == 0:
-                    # Skip this sequence if no valid points at start frame
                     continue
                 
-                # Sample points for this sequence
                 selected_indices = random.sample(
                     valid_point_indices, 
                     min(self.num_points, len(valid_point_indices))
@@ -119,7 +111,6 @@ class PointOdysseyDataset(Dataset):
         video_dir = self.data_root / video_dir_name
         frames_dir = video_dir / "frames"
         
-        # Try jpg first, then png
         frame_path = frames_dir / f"frame_{frame_idx:06d}.jpg"
         if not frame_path.exists():
             frame_path = frames_dir / f"frame_{frame_idx:06d}.png"
@@ -141,15 +132,12 @@ class PointOdysseyDataset(Dataset):
         start_idx = seq_info['start_idx']
         selected_indices = seq_info['selected_indices']
         
-        # Get annotation data for this video
         anno_data = self.video_annotations[video_dir_name]
         trajs_2d = anno_data['trajs_2d']
         visibs = anno_data['visibs']
         
-        # Get frame indices for this sequence
         frame_indices = list(range(start_idx, start_idx + self.sequence_length))
         
-        # Load frames
         frames = []
         original_sizes = []
         for frame_idx in frame_indices:
@@ -159,59 +147,46 @@ class PointOdysseyDataset(Dataset):
         
         frames = np.stack(frames)  # (T, C, H, W)
         
-        # trajs_2d: (T_anno, N_total, 2) in pixel coordinates
-        # visibs: (T_anno, N_total) boolean visibility
-        
-        # Extract trajectories for selected points
+        # trajs_2d: (T_anno, N_total, 2)
+        # visibs: (T_anno, N_total)
         gt_trajectories = []
         gt_visibilities = []
         initial_points = None
         
         for t, frame_idx in enumerate(frame_indices):
             if frame_idx >= trajs_2d.shape[0]:
-                # Pad with last frame if needed
                 frame_idx = trajs_2d.shape[0] - 1
             
-            # Get coordinates for selected points at this frame
             frame_coords = trajs_2d[frame_idx, selected_indices, :]  # (N, 2)
             frame_visibs = visibs[frame_idx, selected_indices]  # (N,)
             
-            # Normalize coordinates based on original image size
             original_size = original_sizes[t]
             normalized_coords = frame_coords.copy()
-            normalized_coords[:, 0] /= original_size[0]  # width
-            normalized_coords[:, 1] /= original_size[1]  # height
+            normalized_coords[:, 0] /= original_size[0]
+            normalized_coords[:, 1] /= original_size[1]
             
-            # Store first frame as initial points
             if t == 0:
                 initial_points = normalized_coords.copy()
             
             gt_trajectories.append(normalized_coords)
             gt_visibilities.append(frame_visibs)
         
-        # Pad if we have fewer points than num_points
         num_selected = len(selected_indices)
         if num_selected < self.num_points:
-            # Pad with zeros (or last point)
             pad_size = self.num_points - num_selected
             for t in range(len(gt_trajectories)):
-                # Pad coordinates with center point
                 pad_coords = np.ones((pad_size, 2), dtype=np.float32) * 0.5
                 gt_trajectories[t] = np.vstack([gt_trajectories[t], pad_coords])
-                # Pad visibilities with False
                 pad_visibs = np.zeros(pad_size, dtype=np.bool_)
                 gt_visibilities[t] = np.hstack([gt_visibilities[t], pad_visibs])
             
-            # Pad initial points
             pad_coords = np.ones((pad_size, 2), dtype=np.float32) * 0.5
             initial_points = np.vstack([initial_points, pad_coords])
         
-        # Convert to numpy arrays
         gt_trajectories = np.array(gt_trajectories, dtype=np.float32)  # (T, N, 2)
         gt_visibilities = np.array(gt_visibilities, dtype=np.float32)  # (T, N)
         initial_points = np.array(initial_points, dtype=np.float32)  # (N, 2)
         
-        # Convert to torch tensors
         frames = torch.from_numpy(frames).float()
         initial_points = torch.from_numpy(initial_points).float()
         gt_trajectories = torch.from_numpy(gt_trajectories).float()
