@@ -59,14 +59,10 @@ class TransformerBlock(nn.Module):
         )
         
     def forward(self, x):
-        # Self-attention
         norm_x = self.norm1(x)
         attn_out, attn_weights = self.attn(norm_x)
         x = x + attn_out
-        
-        # Feed-forward
         x = x + self.mlp(self.norm2(x))
-        
         return x, attn_weights
 
 
@@ -158,9 +154,6 @@ class PointTracker(nn.Module):
         # Point feature embedding
         self.point_embed = nn.Linear(2, hidden_dim)  # (x, y) -> hidden_dim
         
-        # Temporal embedding
-        self.temporal_embed = nn.Embedding(1000, hidden_dim)
-        
         # Transformer layers
         self.transformer_layers = nn.ModuleList([
             TransformerBlock(hidden_dim, num_heads, dropout=dropout)
@@ -208,6 +201,42 @@ class PointTracker(nn.Module):
         
         return sampled_features
     
+    def get_sinusoidal_positional_encoding(self, positions, d_model):
+        """
+        Generate sinusoidal positional encodings for given positions
+        Args:
+            positions: (B, seq_len) tensor of position indices (can be any integer values)
+            d_model: dimension of the model
+        Returns:
+            pos_encoding: (B, seq_len, d_model) positional encodings
+        """
+        B, seq_len = positions.shape
+        device = positions.device
+        
+        # Convert positions to float for computation
+        pos = positions.float()  # (B, seq_len)
+        
+        # Create dimension indices [0, 1, 2, ..., d_model//2 - 1]
+        dim_indices = torch.arange(d_model // 2, dtype=torch.float32, device=device)  # (d_model//2,)
+        
+        # Compute the divisor: 10000^(2i/d_model)
+        div_term = torch.exp(dim_indices * -(torch.log(torch.tensor(10000.0)) / d_model))  # (d_model//2,)
+        
+        # Compute positional encodings
+        # PE(pos, 2i) = sin(pos / 10000^(2i/d_model))
+        # PE(pos, 2i+1) = cos(pos / 10000^(2i/d_model))
+        # pos: (B, seq_len) -> (B, seq_len, 1)
+        # div_term: (d_model//2,) -> (1, 1, d_model//2)
+        pos_expanded = pos.unsqueeze(-1)  # (B, seq_len, 1)
+        div_term_expanded = div_term.unsqueeze(0).unsqueeze(0)  # (1, 1, d_model//2)
+        angle = pos_expanded * div_term_expanded  # (B, seq_len, d_model//2)
+        
+        pos_encoding = torch.zeros(B, seq_len, d_model, device=device)  # (B, seq_len, d_model)
+        pos_encoding[:, :, 0::2] = torch.sin(angle)  # even indices: sin
+        pos_encoding[:, :, 1::2] = torch.cos(angle)  # odd indices: cos
+        
+        return pos_encoding
+    
     def forward(self, frames, initial_points, return_attention=False):
         """
         Forward pass
@@ -238,11 +267,11 @@ class PointTracker(nn.Module):
         point_coords = current_points.reshape(B, T * N, 2)
         point_embeds = self.point_embed(point_coords)
         
-        # Add temporal embeddings
-        temporal_ids = torch.arange(T, device=frames.device).unsqueeze(0).unsqueeze(-1)  # (1, T, 1)
-        temporal_ids = temporal_ids.repeat(B, 1, N)  # (B, T, N)
-        temporal_ids = temporal_ids.reshape(B, T * N)  # (B, T * N)
-        temporal_embeds = self.temporal_embed(temporal_ids)
+        
+        temporal_positions = torch.arange(T, device=frames.device).repeat(N).unsqueeze(0).repeat(B, 1)  # (B, T * N)
+        temporal_embeds = self.get_sinusoidal_positional_encoding(
+            temporal_positions, self.hidden_dim
+        )  # (B, T * N, hidden_dim)
         
         # Combine embeddings
         x = point_features + point_embeds + temporal_embeds
