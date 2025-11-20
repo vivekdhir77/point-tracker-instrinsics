@@ -92,11 +92,11 @@ class PointOdysseyDataset(Dataset):
                 print(f"Warning: Skipping {video_dir_name} - missing frames or anno.npz")
                 continue
             
-            # Load annotation
+            # Load annotation and copy into memory to avoid file handle issues
             try:
-                anno = np.load(anno_path)
-                trajs_2d = anno['trajs_2d']  # (T, N, 2)
-                visibs = anno['visibs']  # (T, N)
+                with np.load(anno_path) as anno:
+                    trajs_2d = anno['trajs_2d'].copy()  # (T, N, 2) - copy into memory
+                    visibs = anno['visibs'].copy()  # (T, N) - copy into memory
             except Exception as e:
                 print(f"Warning: Could not load {anno_path}: {e}")
                 continue
@@ -115,7 +115,9 @@ class PointOdysseyDataset(Dataset):
                 continue
             
             # Get valid point indices (visible in first frame)
-            valid_point_indices = get_valid_point_indices(anno)
+            # Create a temporary dict-like object for get_valid_point_indices
+            temp_anno = {'trajs_2d': trajs_2d, 'visibs': visibs}
+            valid_point_indices = get_valid_point_indices(temp_anno)
             
             if len(valid_point_indices) == 0:
                 print(f"Warning: Skipping {video_dir_name} - no valid points in first frame")
@@ -132,7 +134,8 @@ class PointOdysseyDataset(Dataset):
                 self.sequences.append({
                     'video_dir': video_dir_name,
                     'start_idx': start_idx,
-                    'anno': anno,
+                    'trajs_2d': trajs_2d,  # Store arrays directly instead of file handle
+                    'visibs': visibs,
                     'selected_indices': selected_indices
                 })
     
@@ -164,7 +167,8 @@ class PointOdysseyDataset(Dataset):
         seq_info = self.sequences[idx]
         video_dir_name = seq_info['video_dir']
         start_idx = seq_info['start_idx']
-        anno = seq_info['anno']
+        trajs_2d = seq_info['trajs_2d']  # Already loaded in memory
+        visibs = seq_info['visibs']  # Already loaded in memory
         selected_indices = seq_info['selected_indices']
         
         # Get frame indices for this sequence
@@ -180,11 +184,8 @@ class PointOdysseyDataset(Dataset):
         
         frames = np.stack(frames)  # (T, C, H, W)
         
-        # Get ground truth trajectories from annotation
         # trajs_2d: (T_anno, N_total, 2) in pixel coordinates
         # visibs: (T_anno, N_total) boolean visibility
-        trajs_2d = anno['trajs_2d']
-        visibs = anno['visibs']
         
         # Extract trajectories for selected points
         gt_trajectories = []
