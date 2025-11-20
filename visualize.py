@@ -23,7 +23,7 @@ def visualize_attention(attention_weights_list, frames, save_path=None, layer_id
         return
     
     attn = attention_weights_list[layer_idx][0]  # (num_heads, N, N)
-    attn = attn[head_idx].cpu().numpy()  # (N, N)
+    attn = attn[head_idx].detach().cpu().numpy()  # (N, N)
     
     T, C, H, W = frames.shape
     num_points = attn.shape[0] // T
@@ -185,7 +185,7 @@ def visualize_attention_heads(attention_weights_list, save_path=None, layer_idx=
     axes = axes.flatten() if num_heads > 1 else [axes]
     
     for head_idx in range(num_heads):
-        attn_head = attn[head_idx].cpu().numpy()
+        attn_head = attn[head_idx].detach().cpu().numpy()
         im = axes[head_idx].imshow(attn_head, cmap='hot', aspect='auto')
         axes[head_idx].set_title(f'Head {head_idx}')
         plt.colorbar(im, ax=axes[head_idx])
