@@ -76,10 +76,14 @@ class PointOdysseyDataset(Dataset):
             
             frames_in_dir = len(frame_files)
             frames_in_anno = trajs_2d.shape[0]
-            num_frames = min(self.min_frames, min(frames_in_dir, frames_in_anno))
+            num_frames = min(frames_in_dir, frames_in_anno)
+            
+            if num_frames < self.min_frames:
+                print(f"Warning: Skipping {video_dir_name} - only {num_frames} frames available (minimum: {self.min_frames})")
+                continue
             
             if num_frames < sequence_length:
-                print(f"Warning: Skipping {video_dir_name} - only {num_frames} frames available")
+                print(f"Warning: Skipping {video_dir_name} - only {num_frames} frames available (need at least {sequence_length} for sequence_length)")
                 continue
             
             for start_idx in range(num_frames - sequence_length + 1):
