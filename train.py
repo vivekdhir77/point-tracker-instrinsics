@@ -91,15 +91,15 @@ def train_epoch(model, dataloader, optimizer, device, epoch, writer, save_dir):
         if batch_idx % 50 == 0 and batch_idx > 0:
             visualize_attention(
                 attention_weights,
-                frames[0].cpu().numpy(),
+                frames[0].detach().cpu().numpy(),
                 save_path=save_dir / f'attention_epoch{epoch}_batch{batch_idx}.png'
             )
             
             visualize_predictions(
-                frames[0].cpu().numpy(),
-                pred_points[0].cpu().numpy(),
-                gt_trajectories[0].cpu().numpy(),
-                initial_points[0].cpu().numpy(),
+                frames[0].detach().cpu().numpy(),
+                pred_points[0].detach().cpu().numpy(),
+                gt_trajectories[0].detach().cpu().numpy(),
+                initial_points[0].detach().cpu().numpy(),
                 save_path=save_dir / f'predictions_epoch{epoch}_batch{batch_idx}.png'
             )
     
@@ -130,14 +130,14 @@ def validate(model, dataloader, device, epoch, writer, save_dir):
             if batch_idx == 0:
                 visualize_attention(
                     attention_weights,
-                    frames[0].cpu().numpy(),
+                    frames[0].detach().cpu().numpy(),
                     save_path=save_dir / f'val_attention_epoch{epoch}.png'
                 )
                 visualize_predictions(
-                    frames[0].cpu().numpy(),
-                    pred_points[0].cpu().numpy(),
-                    gt_trajectories[0].cpu().numpy(),
-                    initial_points[0].cpu().numpy(),
+                    frames[0].detach().cpu().numpy(),
+                    pred_points[0].detach().cpu().numpy(),
+                    gt_trajectories[0].detach().cpu().numpy(),
+                    initial_points[0].detach().cpu().numpy(),
                     save_path=save_dir / f'val_predictions_epoch{epoch}.png'
                 )
     
