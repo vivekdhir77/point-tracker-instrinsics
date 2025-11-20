@@ -154,13 +154,24 @@ class PointTracker(nn.Module):
         # Point feature embedding
         self.point_embed = nn.Linear(2, hidden_dim)  # (x, y) -> hidden_dim
         
+        # Project point features to hidden dimension
+        self.point_feat_proj = nn.Linear(feature_dim, hidden_dim)
+        
+        # Tracking head for iterative point tracking (used for frames [0, T-1])
+        self.tracking_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, 2)  # Predict (x, y) offset
+        )
+        
         # Transformer layers
         self.transformer_layers = nn.ModuleList([
             TransformerBlock(hidden_dim, num_heads, dropout=dropout)
             for _ in range(num_layers)
         ])
         
-        # Output head for point prediction
+        # Output head for point prediction (used for frame T)
         self.output_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
@@ -251,30 +262,103 @@ class PointTracker(nn.Module):
         B, T, C, H, W = frames.shape
         N = initial_points.shape[1]
         
-        # Extract features
-        features = self.feature_extractor(frames)  # (B, T, C_feat, H_feat, W_feat)
+        # Extract frame features for all frames [0, T]
+        frame_features = self.feature_extractor(frames)  # (B, T, C_feat, H_feat, W_feat)
         
-        # Initialize point trajectories
-        current_points = initial_points.unsqueeze(1).repeat(1, T, 1, 1)  # (B, T, N, 2)
+        # Track points through frames [0, T-1] to get point features
+        # Vectorized tracking: process all frames in a batched manner
+        # Initialize with initial points
+        tracked_points = initial_points.unsqueeze(1)  # (B, 1, N, 2)
         
-        # Extract point features
-        point_features = self.extract_point_features(features, current_points)  # (B, T, N, C)
+        # Track points frame by frame - still sequential but more efficient
+        for t in range(T - 1):
+            current_frame_points = tracked_points[:, -1, :, :]  # (B, N, 2) - last frame's points
+            current_frame_features = frame_features[:, t, :, :, :]  # (B, C_feat, H_feat, W_feat)
+            
+            # Extract point features at current frame
+            current_points_expanded = current_frame_points.unsqueeze(1)  # (B, 1, N, 2)
+            current_frame_features_expanded = current_frame_features.unsqueeze(1)  # (B, 1, C_feat, H_feat, W_feat)
+            
+            point_feat = self.extract_point_features(
+                current_frame_features_expanded, 
+                current_points_expanded
+            )  # (B, 1, N, C_feat)
+            
+            # Reshape for processing
+            point_feat_flat = point_feat.reshape(B, N, self.feature_dim)  # (B, N, C_feat)
+            
+            # Project point features to hidden dimension
+            point_feat_proj = self.point_feat_proj(point_feat_flat)  # (B, N, hidden_dim)
+            
+            # Predict offset for next frame
+            offset = self.tracking_head(point_feat_proj)  # (B, N, 2)
+            next_points = current_frame_points + offset
+            tracked_points = torch.cat([tracked_points, next_points.unsqueeze(1)], dim=1)  # (B, t+2, N, 2)
         
-        # Flatten temporal and point dimensions
-        point_features = point_features.reshape(B, T * N, self.feature_dim)
+        # Now we have tracked points for frames [0, T-1] (T frames total)
+        # Vectorized extraction of point features for frames [0, T-2]
+        # tracked_points: (B, T, N, 2)
+        # frame_features: (B, T, C_feat, H_feat, W_feat)
         
-        # Add point embeddings
-        point_coords = current_points.reshape(B, T * N, 2)
-        point_embeds = self.point_embed(point_coords)
+        # Extract point features for all frames [0, T-2] in one batch
+        frame_feat_history = frame_features[:, :T-1, :, :, :]  # (B, T-1, C_feat, H_feat, W_feat)
+        points_history = tracked_points[:, :T-1, :, :]  # (B, T-1, N, 2)
         
+        # Vectorized point feature extraction
+        point_features_history = self.extract_point_features(
+            frame_feat_history, 
+            points_history
+        )  # (B, T-1, N, C_feat)
         
-        temporal_positions = torch.arange(T, device=frames.device).repeat(N).unsqueeze(0).repeat(B, 1)  # (B, T * N)
-        temporal_embeds = self.get_sinusoidal_positional_encoding(
-            temporal_positions, self.hidden_dim
-        )  # (B, T * N, hidden_dim)
+        # Get frame features for frame T (the last frame, index T-1 in 0-indexed)
+        # We'll use frame features from the last frame for prediction
+        frame_feat_T = frame_features[:, T-1, :, :, :]  # (B, C_feat, H_feat, W_feat)
         
-        # Combine embeddings
-        x = point_features + point_embeds + temporal_embeds
+        # Get the last tracked points (from frame T-1) as starting point for frame T
+        last_points = tracked_points[:, -1, :, :]  # (B, N, 2) - points at frame T-1
+        
+        # Extract point features at frame T using last tracked points
+        # (We sample at last known positions to get context)
+        frame_feat_T_expanded = frame_feat_T.unsqueeze(1)  # (B, 1, C_feat, H_feat, W_feat)
+        last_points_expanded = last_points.unsqueeze(1)  # (B, 1, N, 2)
+        point_feat_T = self.extract_point_features(
+            frame_feat_T_expanded, 
+            last_points_expanded
+        )  # (B, 1, N, C_feat)
+        
+        # Combine point features from [0, T-1] with point features at T
+        # Flatten temporal and point dimensions for point features history
+        point_features_history_flat = point_features_history.reshape(B, (T-1) * N, self.feature_dim)  # (B, (T-1)*N, C_feat)
+        point_feat_T_flat = point_feat_T.reshape(B, N, self.feature_dim)  # (B, N, C_feat)
+        
+        # Project point features to hidden dimension
+        point_feat_history_proj = self.point_feat_proj(point_features_history_flat)  # (B, (T-1)*N, hidden_dim)
+        point_feat_T_proj = self.point_feat_proj(point_feat_T_flat)  # (B, N, hidden_dim)
+        
+        # Add point embeddings for history
+        point_coords_history = tracked_points[:, :T-1, :, :].reshape(B, (T-1) * N, 2)  # (B, (T-1)*N, 2)
+        point_embeds_history = self.point_embed(point_coords_history)  # (B, (T-1)*N, hidden_dim)
+        
+        # Add point embeddings for frame T
+        point_embeds_T = self.point_embed(last_points)  # (B, N, hidden_dim)
+        
+        # Add temporal positional encodings
+        temporal_positions_history = torch.arange(T-1, device=frames.device).unsqueeze(1).repeat(1, N).reshape(1, -1).repeat(B, 1)  # (B, (T-1)*N)
+        temporal_embeds_history = self.get_sinusoidal_positional_encoding(
+            temporal_positions_history, self.hidden_dim
+        )  # (B, (T-1)*N, hidden_dim)
+        
+        temporal_positions_T = torch.full((B, N), T-1, device=frames.device)  # (B, N)
+        temporal_embeds_T = self.get_sinusoidal_positional_encoding(
+            temporal_positions_T, self.hidden_dim
+        )  # (B, N, hidden_dim)
+        
+        # Combine all features
+        x_history = point_feat_history_proj + point_embeds_history + temporal_embeds_history  # (B, (T-1)*N, hidden_dim)
+        x_T = point_feat_T_proj + point_embeds_T + temporal_embeds_T  # (B, N, hidden_dim)
+        
+        # Concatenate history and current frame features
+        x = torch.cat([x_history, x_T], dim=1)  # (B, T*N, hidden_dim)
         
         # Process through transformer
         attention_weights_list = []
@@ -282,14 +366,19 @@ class PointTracker(nn.Module):
             x, attn_weights = layer(x)
             attention_weights_list.append(attn_weights)
         
-        # Predict point offsets
-        offsets = self.output_head(x)  # (B, T*N, 2)
-        offsets = offsets.reshape(B, T, N, 2)
+        # Predict point offsets for frame T (only for the last N tokens)
+        x_T_out = x[:, -N:, :]  # (B, N, hidden_dim) - last N tokens correspond to frame T
+        offsets_T = self.output_head(x_T_out)  # (B, N, 2)
         
-        # Add offsets to current points
-        predicted_points = current_points + offsets
+        # Add offsets to last tracked points to get refined predictions for frame T-1 (last frame)
+        predicted_points_T = last_points + offsets_T  # (B, N, 2)
+        
+        # Combine tracked points [0, T-2] with refined prediction for frame T-1
+        # tracked_points: (B, T, N, 2) contains all tracked points
+        all_tracked_points = tracked_points[:, :T-1, :, :]  # (B, T-1, N, 2) - exclude last frame
+        predicted_points_T_expanded = predicted_points_T.unsqueeze(1)  # (B, 1, N, 2)
+        predicted_points = torch.cat([all_tracked_points, predicted_points_T_expanded], dim=1)  # (B, T, N, 2)
         
         if return_attention:
             return predicted_points, attention_weights_list
         return predicted_points
-
