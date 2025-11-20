@@ -214,8 +214,10 @@ class PointTracker(nn.Module):
         point_embeds = self.point_embed(point_coords)
         
         # Add temporal embeddings
-        temporal_ids = torch.arange(T, device=frames.device).unsqueeze(0).unsqueeze(-1)
-        temporal_ids = temporal_ids.repeat(1, 1, N).reshape(B, T * N)
+        # Create temporal IDs: [0, 1, 2, ..., T-1] for each point, repeated for batch
+        temporal_ids = torch.arange(T, device=frames.device).unsqueeze(0).unsqueeze(-1)  # (1, T, 1)
+        temporal_ids = temporal_ids.repeat(B, 1, N)  # (B, T, N)
+        temporal_ids = temporal_ids.reshape(B, T * N)  # (B, T * N)
         temporal_embeds = self.temporal_embed(temporal_ids)
         
         # Combine embeddings
