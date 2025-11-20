@@ -161,8 +161,8 @@ class PointTracker(nn.Module):
         points_pixel[:, :, :, 1] = points_pixel[:, :, :, 1] * (H - 1)
         
         # Reshape for grid_sample
-        features_flat = features.view(B * T, C, H, W)
-        points_flat = points_pixel.view(B * T, N, 1, 2)
+        features_flat = features.reshape(B * T, C, H, W)
+        points_flat = points_pixel.reshape(B * T, N, 1, 2)
         
         # Normalize to [-1, 1] for grid_sample
         points_normalized = points_flat.clone()
@@ -179,7 +179,7 @@ class PointTracker(nn.Module):
         )  # (B*T, C, N, 1)
         
         sampled_features = sampled_features.squeeze(-1).transpose(1, 2)  # (B*T, N, C)
-        sampled_features = sampled_features.view(B, T, N, C)
+        sampled_features = sampled_features.reshape(B, T, N, C)
         
         return sampled_features
     
@@ -207,15 +207,15 @@ class PointTracker(nn.Module):
         point_features = self.extract_point_features(features, current_points)  # (B, T, N, C)
         
         # Flatten temporal and point dimensions
-        point_features = point_features.view(B, T * N, self.feature_dim)
+        point_features = point_features.reshape(B, T * N, self.feature_dim)
         
         # Add point embeddings
-        point_coords = current_points.view(B, T * N, 2)
+        point_coords = current_points.reshape(B, T * N, 2)
         point_embeds = self.point_embed(point_coords)
         
         # Add temporal embeddings
         temporal_ids = torch.arange(T, device=frames.device).unsqueeze(0).unsqueeze(-1)
-        temporal_ids = temporal_ids.repeat(1, 1, N).view(B, T * N)
+        temporal_ids = temporal_ids.repeat(1, 1, N).reshape(B, T * N)
         temporal_embeds = self.temporal_embed(temporal_ids)
         
         # Combine embeddings
@@ -229,7 +229,7 @@ class PointTracker(nn.Module):
         
         # Predict point offsets
         offsets = self.output_head(x)  # (B, T*N, 2)
-        offsets = offsets.view(B, T, N, 2)
+        offsets = offsets.reshape(B, T, N, 2)
         
         # Add offsets to current points
         predicted_points = current_points + offsets
