@@ -92,15 +92,10 @@ class PointOdysseyDataset(Dataset):
                 if len(valid_point_indices) == 0:
                     continue
                 
-                selected_indices = random.sample(
-                    valid_point_indices, 
-                    min(self.num_points, len(valid_point_indices))
-                )
-                
                 self.sequences.append({
                     'video_dir': video_dir_name,
                     'start_idx': start_idx,
-                    'selected_indices': selected_indices
+                    'valid_indices': valid_point_indices
                 })
     
     def __len__(self):
@@ -130,7 +125,9 @@ class PointOdysseyDataset(Dataset):
         seq_info = self.sequences[idx]
         video_dir_name = seq_info['video_dir']
         start_idx = seq_info['start_idx']
-        selected_indices = seq_info['selected_indices']
+        valid_indices = seq_info['valid_indices']
+        num_selectable = min(self.num_points, len(valid_indices))
+        selected_indices = random.sample(valid_indices, num_selectable)
         
         anno_data = self.video_annotations[video_dir_name]
         trajs_2d = anno_data['trajs_2d']
