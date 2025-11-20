@@ -6,7 +6,6 @@ A transformer-based point tracking model for tracking points across video sequen
 
 - Transformer-based architecture with multi-head attention
 - Supports Point Odyssey dataset format
-- Synthetic dataset for testing
 - Visualization tools for attention and predictions
 - TensorBoard logging
 - Checkpoint saving and resuming
@@ -63,7 +62,27 @@ python train.py \
     --image_size 256 \
     --num_workers 4 \
     --save_dir ./checkpoints \
-    --log_dir ./logs
+    --log_dir ./logs \
+    --backbone resnet18
+```
+
+### Training with Different Backbone
+
+Use a larger backbone for potentially better performance:
+
+```bash
+python train.py \
+    --data_root /path/to/point_odyssey_dataset \
+    --backbone resnet50
+```
+
+Or train from scratch without pre-trained weights:
+
+```bash
+python train.py \
+    --data_root /path/to/point_odyssey_dataset \
+    --backbone resnet18 \
+    --no_pretrained
 ```
 
 ### Training on Specific Videos
@@ -84,16 +103,9 @@ python train.py \
     --resume ./checkpoints/latest.pth
 ```
 
-### Training with Synthetic Data (for testing)
-
-```bash
-python train.py --use_synthetic
-```
-
 ## Training Arguments
 
-- `--data_root`: Path to Point Odyssey dataset root directory
-- `--use_synthetic`: Use synthetic dataset instead of Point Odyssey (for testing)
+- `--data_root`: Path to Point Odyssey dataset root directory (required)
 - `--batch_size`: Batch size (default: 4)
 - `--epochs`: Number of training epochs (default: 50)
 - `--lr`: Learning rate (default: 1e-4)
@@ -105,14 +117,25 @@ python train.py --use_synthetic
 - `--log_dir`: Directory for TensorBoard logs (default: ./logs)
 - `--resume`: Path to checkpoint to resume from
 - `--video_dirs`: Comma-separated list of video directories to use (default: all)
+- `--backbone`: Backbone architecture - `resnet18`, `resnet34`, or `resnet50` (default: resnet18)
+- `--no_pretrained`: Disable pre-trained weights for backbone (train from scratch)
 
 ## Model Architecture
 
 The model consists of:
-- **Feature Extractor**: CNN backbone to extract features from video frames
+- **Feature Extractor**: Pre-trained ResNet backbone (ResNet18/34/50) to extract features from video frames
 - **Point Feature Extraction**: Bilinear interpolation to extract features at point locations
 - **Transformer Layers**: Multi-head self-attention to model temporal and spatial relationships
 - **Output Head**: Predicts point offsets for tracking
+
+### Backbone Options
+
+The model uses pre-trained ResNet backbones by default for better feature extraction:
+- `resnet18`: Lightweight, fast (default)
+- `resnet34`: Medium complexity
+- `resnet50`: More powerful, slower
+
+You can disable pre-trained weights using `--no_pretrained` flag.
 
 ## Outputs
 
@@ -135,14 +158,6 @@ View training progress with TensorBoard:
 
 ```bash
 tensorboard --logdir ./logs
-```
-
-## Testing
-
-Test the model with synthetic data:
-
-```bash
-python test_model.py
 ```
 
 ## Model Parameters

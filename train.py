@@ -7,14 +7,12 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import numpy as np
-import matplotlib.pyplot as plt
 from pathlib import Path
 import argparse
 from tqdm import tqdm
-import os
 
 from model import PointTracker
-from dataset import PointOdysseyDataset, SyntheticDataset
+from dataset import PointOdysseyDataset
 from visualize import visualize_attention, plot_loss_history, visualize_predictions
 
 
@@ -51,6 +49,13 @@ def compute_loss(pred_points, gt_points, initial_points):
     }
 
 
+def accumulate_losses(total_losses, losses, num_batches):
+    """Helper function to accumulate losses"""
+    for key in total_losses:
+        total_losses[key] += losses[key].item()
+    return num_batches + 1
+
+
 def train_epoch(model, dataloader, optimizer, device, epoch, writer, save_dir):
     """Train for one epoch"""
     model.train()
@@ -80,9 +85,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, writer, save_dir):
         optimizer.step()
         
         # Accumulate losses
-        for key in total_losses:
-            total_losses[key] += losses[key].item()
-        num_batches += 1
+        num_batches = accumulate_losses(total_losses, losses, num_batches)
         
         # Update progress bar
         pbar.set_postfix({
@@ -139,9 +142,7 @@ def validate(model, dataloader, device, epoch, writer, save_dir):
             losses = compute_loss(pred_points, gt_trajectories, initial_points)
             
             # Accumulate losses
-            for key in total_losses:
-                total_losses[key] += losses[key].item()
-            num_batches += 1
+            num_batches = accumulate_losses(total_losses, losses, num_batches)
             
             # Visualize first batch
             if batch_idx == 0:
@@ -170,10 +171,8 @@ def validate(model, dataloader, device, epoch, writer, save_dir):
 
 def main():
     parser = argparse.ArgumentParser(description='Train Point Tracker')
-    parser.add_argument('--data_root', type=str, default=None,
+    parser.add_argument('--data_root', type=str, required=True,
                         help='Path to Point Odyssey dataset root')
-    parser.add_argument('--use_synthetic', action='store_true',
-                        help='Use synthetic dataset for testing')
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--lr', type=float, default=1e-4)
@@ -187,6 +186,11 @@ def main():
                         help='Path to checkpoint to resume from')
     parser.add_argument('--video_dirs', type=str, default=None,
                         help='Comma-separated list of video directories to use (default: all)')
+    parser.add_argument('--backbone', type=str, default='resnet18',
+                        choices=['resnet18', 'resnet34', 'resnet50'],
+                        help='Backbone architecture (default: resnet18)')
+    parser.add_argument('--no_pretrained', action='store_true',
+                        help='Disable pre-trained weights for backbone')
     
     args = parser.parse_args()
     
@@ -205,40 +209,24 @@ def main():
     print(f'Using device: {device}')
     
     # Create dataset
-    if args.use_synthetic or args.data_root is None:
-        print('Using synthetic dataset')
-        train_dataset = SyntheticDataset(
-            num_samples=1000,
-            sequence_length=args.sequence_length,
-            num_points=args.num_points,
-            image_size=(args.image_size, args.image_size)
-        )
-        val_dataset = SyntheticDataset(
-            num_samples=200,
-            sequence_length=args.sequence_length,
-            num_points=args.num_points,
-            image_size=(args.image_size, args.image_size)
-        )
-    else:
-        print(f'Using Point Odyssey dataset from {args.data_root}')
-        # You can specify video_dirs or leave None to use all videos
-        video_dirs = getattr(args, 'video_dirs', None)
-        if video_dirs:
-            video_dirs = video_dirs.split(',') if isinstance(video_dirs, str) else video_dirs
-        
-        # Split dataset (simple approach - use first 80% for train)
-        full_dataset = PointOdysseyDataset(
-            data_root=args.data_root,
-            video_dirs=video_dirs,
-            sequence_length=args.sequence_length,
-            num_points=args.num_points,
-            image_size=(args.image_size, args.image_size)
-        )
-        train_size = int(0.8 * len(full_dataset))
-        val_size = len(full_dataset) - train_size
-        train_dataset, val_dataset = torch.utils.data.random_split(
-            full_dataset, [train_size, val_size]
-        )
+    print(f'Using Point Odyssey dataset from {args.data_root}')
+    # You can specify video_dirs or leave None to use all videos
+    video_dirs = getattr(args, 'video_dirs', None)
+    if video_dirs:
+        video_dirs = video_dirs.split(',') if isinstance(video_dirs, str) else video_dirs
+    
+    full_dataset = PointOdysseyDataset(
+        data_root=args.data_root,
+        video_dirs=video_dirs,
+        sequence_length=args.sequence_length,
+        num_points=args.num_points,
+        image_size=(args.image_size, args.image_size)
+    )
+    train_size = int(0.8 * len(full_dataset))
+    val_size = len(full_dataset) - train_size
+    train_dataset, val_dataset = torch.utils.data.random_split(
+        full_dataset, [train_size, val_size]
+    )
     
     # Create dataloaders
     train_loader = DataLoader(
@@ -263,7 +251,9 @@ def main():
         num_heads=8,
         num_layers=4,
         num_points=args.num_points,
-        dropout=0.1
+        dropout=0.1,
+        backbone=args.backbone,
+        pretrained=not args.no_pretrained
     ).to(device)
     
     print(f'Model parameters: {sum(p.numel() for p in model.parameters()):,}')

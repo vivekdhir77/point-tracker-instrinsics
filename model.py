@@ -4,6 +4,7 @@ Point Tracker Model with Attention Mechanism
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision.models as models
 
 
 class MultiHeadAttention(nn.Module):
@@ -70,34 +71,58 @@ class TransformerBlock(nn.Module):
 
 
 class FeatureExtractor(nn.Module):
-    """CNN feature extractor for image frames"""
+    """
+    CNN feature extractor using pre-trained ResNet backbone
+    Can use ResNet18, ResNet34, or ResNet50
+    """
     
-    def __init__(self, in_channels=3, out_dim=256):
+    def __init__(self, in_channels=3, out_dim=256, backbone='resnet18', pretrained=True):
         super().__init__()
-        self.conv1 = nn.Conv2d(in_channels, 64, 7, stride=2, padding=3)
-        self.bn1 = nn.BatchNorm2d(64)
-        self.conv2 = nn.Conv2d(64, 128, 3, stride=2, padding=1)
-        self.bn2 = nn.BatchNorm2d(128)
-        self.conv3 = nn.Conv2d(128, 256, 3, stride=2, padding=1)
-        self.bn3 = nn.BatchNorm2d(256)
-        self.conv4 = nn.Conv2d(256, out_dim, 3, padding=1)
-        self.bn4 = nn.BatchNorm2d(out_dim)
+        self.backbone_name = backbone
+        
+        # Load pre-trained ResNet backbone
+        if backbone == 'resnet18':
+            resnet = models.resnet18(pretrained=pretrained)
+            backbone_dim = 512
+        elif backbone == 'resnet34':
+            resnet = models.resnet34(pretrained=pretrained)
+            backbone_dim = 512
+        elif backbone == 'resnet50':
+            resnet = models.resnet50(pretrained=pretrained)
+            backbone_dim = 2048
+        else:
+            raise ValueError(f"Unsupported backbone: {backbone}. Choose from 'resnet18', 'resnet34', 'resnet50'")
+        
+        # Remove the final fully connected layer and average pooling
+        # We want to keep spatial dimensions
+        self.backbone = nn.Sequential(*list(resnet.children())[:-2])
+        
+        # Project to desired output dimension
+        if backbone_dim != out_dim:
+            self.projection = nn.Sequential(
+                nn.Conv2d(backbone_dim, out_dim, 1),
+                nn.BatchNorm2d(out_dim),
+                nn.ReLU(inplace=True)
+            )
+        else:
+            self.projection = nn.Identity()
         
     def forward(self, x):
         # x: (B, T, C, H, W)
         B, T, C, H, W = x.shape
         x = x.view(B * T, C, H, W)
         
-        x = F.relu(self.bn1(self.conv1(x)))
-        x = F.relu(self.bn2(self.conv2(x)))
-        x = F.relu(self.bn3(self.conv3(x)))
-        x = F.relu(self.bn4(self.conv4(x)))
+        # Extract features using backbone
+        features = self.backbone(x)  # (B*T, backbone_dim, H', W')
+        
+        # Project to desired dimension
+        features = self.projection(features)  # (B*T, out_dim, H', W')
         
         # Reshape back
-        _, C_out, H_out, W_out = x.shape
-        x = x.view(B, T, C_out, H_out, W_out)
+        _, C_out, H_out, W_out = features.shape
+        features = features.view(B, T, C_out, H_out, W_out)
         
-        return x
+        return features
 
 
 class PointTracker(nn.Module):
@@ -113,21 +138,28 @@ class PointTracker(nn.Module):
         num_heads=8,
         num_layers=4,
         num_points=8,
-        dropout=0.1
+        dropout=0.1,
+        backbone='resnet18',
+        pretrained=True
     ):
         super().__init__()
         self.num_points = num_points
         self.feature_dim = feature_dim
         self.hidden_dim = hidden_dim
         
-        # Feature extractor
-        self.feature_extractor = FeatureExtractor(in_channels=3, out_dim=feature_dim)
+        # Feature extractor with pre-trained backbone
+        self.feature_extractor = FeatureExtractor(
+            in_channels=3, 
+            out_dim=feature_dim,
+            backbone=backbone,
+            pretrained=pretrained
+        )
         
         # Point feature embedding
         self.point_embed = nn.Linear(2, hidden_dim)  # (x, y) -> hidden_dim
         
         # Temporal embedding
-        self.temporal_embed = nn.Embedding(1000, hidden_dim)  # Support up to 1000 frames
+        self.temporal_embed = nn.Embedding(1000, hidden_dim)
         
         # Transformer layers
         self.transformer_layers = nn.ModuleList([
@@ -155,19 +187,12 @@ class PointTracker(nn.Module):
         B, T, C, H, W = features.shape
         N = points.shape[2]
         
-        # Convert normalized coordinates to pixel coordinates
-        points_pixel = points.clone()
-        points_pixel[:, :, :, 0] = points_pixel[:, :, :, 0] * (W - 1)
-        points_pixel[:, :, :, 1] = points_pixel[:, :, :, 1] * (H - 1)
-        
         # Reshape for grid_sample
         features_flat = features.reshape(B * T, C, H, W)
-        points_flat = points_pixel.reshape(B * T, N, 1, 2)
+        points_flat = points.reshape(B * T, N, 1, 2)
         
-        # Normalize to [-1, 1] for grid_sample
-        points_normalized = points_flat.clone()
-        points_normalized[:, :, :, 0] = (points_normalized[:, :, :, 0] / (W - 1)) * 2 - 1
-        points_normalized[:, :, :, 1] = (points_normalized[:, :, :, 1] / (H - 1)) * 2 - 1
+        # Normalize to [-1, 1] for grid_sample (from [0, 1] normalized coordinates)
+        points_normalized = points_flat * 2 - 1
         
         # Sample features using bilinear interpolation
         sampled_features = F.grid_sample(
@@ -214,7 +239,6 @@ class PointTracker(nn.Module):
         point_embeds = self.point_embed(point_coords)
         
         # Add temporal embeddings
-        # Create temporal IDs: [0, 1, 2, ..., T-1] for each point, repeated for batch
         temporal_ids = torch.arange(T, device=frames.device).unsqueeze(0).unsqueeze(-1)  # (1, T, 1)
         temporal_ids = temporal_ids.repeat(B, 1, N)  # (B, T, N)
         temporal_ids = temporal_ids.reshape(B, T * N)  # (B, T * N)
@@ -235,9 +259,6 @@ class PointTracker(nn.Module):
         
         # Add offsets to current points
         predicted_points = current_points + offsets
-        
-        # Clamp to valid range
-        predicted_points = torch.clamp(predicted_points, 0, 1)
         
         if return_attention:
             return predicted_points, attention_weights_list

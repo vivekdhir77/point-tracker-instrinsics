@@ -11,37 +11,6 @@ from pathlib import Path
 import random
 
 
-def normalize_coordinates(coordinates, image_size):
-    """Normalize coordinates to [0, 1] range"""
-    width, height = image_size
-    normalized_coordinates = coordinates.clone()
-    normalized_coordinates[:, 0] /= width
-    normalized_coordinates[:, 1] /= height
-    return normalized_coordinates
-
-
-def get_valid_point_indices(anno):
-    """
-    Get valid point indices from annotation data.
-    Points are valid if they are visible in the first frame.
-    
-    Args:
-        anno: Annotation data loaded from npz file
-        
-    Returns:
-        List of valid point indices
-    """
-    total_points = anno['trajs_2d'].shape[1]
-    valid_point_indices = []
-    first_frame_visibs = anno['visibs'][0]
-    
-    for point_idx in range(total_points):
-        if first_frame_visibs[point_idx]:
-            valid_point_indices.append(point_idx)
-    
-    return valid_point_indices
-
-
 class PointOdysseyDataset(Dataset):
     """
     Dataset loader for Point Odyssey dataset
@@ -81,7 +50,8 @@ class PointOdysseyDataset(Dataset):
         else:
             self.video_dirs = video_dirs
         
-        # Build list of valid sequences
+        # Store annotation data once per video to avoid duplication
+        self.video_annotations = {}
         self.sequences = []
         for video_dir_name in self.video_dirs:
             video_dir = self.data_root / video_dir_name
@@ -91,17 +61,19 @@ class PointOdysseyDataset(Dataset):
             if not frames_dir.exists() or not anno_path.exists():
                 print(f"Warning: Skipping {video_dir_name} - missing frames or anno.npz")
                 continue
-            
-            # Load annotation and copy into memory to avoid file handle issues
             try:
                 with np.load(anno_path) as anno:
                     trajs_2d = anno['trajs_2d'].copy()  # (T, N, 2) - copy into memory
                     visibs = anno['visibs'].copy()  # (T, N) - copy into memory
+                # Store annotation data once per video
+                self.video_annotations[video_dir_name] = {
+                    'trajs_2d': trajs_2d,
+                    'visibs': visibs
+                }
             except Exception as e:
                 print(f"Warning: Could not load {anno_path}: {e}")
                 continue
             
-            # Get frame files
             frame_files = sorted(frames_dir.glob("frame_*.jpg"))
             if len(frame_files) == 0:
                 frame_files = sorted(frames_dir.glob("frame_*.png"))
@@ -114,17 +86,19 @@ class PointOdysseyDataset(Dataset):
                 print(f"Warning: Skipping {video_dir_name} - only {num_frames} frames available")
                 continue
             
-            # Get valid point indices (visible in first frame)
-            # Create a temporary dict-like object for get_valid_point_indices
-            temp_anno = {'trajs_2d': trajs_2d, 'visibs': visibs}
-            valid_point_indices = get_valid_point_indices(temp_anno)
-            
-            if len(valid_point_indices) == 0:
-                print(f"Warning: Skipping {video_dir_name} - no valid points in first frame")
-                continue
-            
             # Create sequences
             for start_idx in range(num_frames - sequence_length + 1):
+                # Get valid point indices visible at the start frame of this sequence
+                start_frame_visibs = visibs[start_idx]
+                valid_point_indices = [
+                    point_idx for point_idx in range(visibs.shape[1])
+                    if start_frame_visibs[point_idx]
+                ]
+                
+                if len(valid_point_indices) == 0:
+                    # Skip this sequence if no valid points at start frame
+                    continue
+                
                 # Sample points for this sequence
                 selected_indices = random.sample(
                     valid_point_indices, 
@@ -134,8 +108,6 @@ class PointOdysseyDataset(Dataset):
                 self.sequences.append({
                     'video_dir': video_dir_name,
                     'start_idx': start_idx,
-                    'trajs_2d': trajs_2d,  # Store arrays directly instead of file handle
-                    'visibs': visibs,
                     'selected_indices': selected_indices
                 })
     
@@ -167,9 +139,12 @@ class PointOdysseyDataset(Dataset):
         seq_info = self.sequences[idx]
         video_dir_name = seq_info['video_dir']
         start_idx = seq_info['start_idx']
-        trajs_2d = seq_info['trajs_2d']  # Already loaded in memory
-        visibs = seq_info['visibs']  # Already loaded in memory
         selected_indices = seq_info['selected_indices']
+        
+        # Get annotation data for this video
+        anno_data = self.video_annotations[video_dir_name]
+        trajs_2d = anno_data['trajs_2d']
+        visibs = anno_data['visibs']
         
         # Get frame indices for this sequence
         frame_indices = list(range(start_idx, start_idx + self.sequence_length))
@@ -250,84 +225,3 @@ class PointOdysseyDataset(Dataset):
             'video_name': video_dir_name,
             'start_idx': start_idx
         }
-
-
-class SyntheticDataset(Dataset):
-    """
-    Synthetic dataset for testing when Point Odyssey data is not available
-    Creates simple moving points on synthetic backgrounds
-    """
-    
-    def __init__(
-        self,
-        num_samples=1000,
-        sequence_length=8,
-        num_points=8,
-        image_size=(256, 256),
-        augment=True
-    ):
-        self.num_samples = num_samples
-        self.sequence_length = sequence_length
-        self.num_points = num_points
-        self.image_size = image_size
-        self.augment = augment
-    
-    def __len__(self):
-        return self.num_samples
-    
-    def __getitem__(self, idx):
-        H, W = self.image_size
-        
-        # Generate random background
-        frames = []
-        gt_trajectories = []
-        
-        # Initialize random points
-        initial_points = np.random.rand(self.num_points, 2).astype(np.float32)
-        
-        # Generate trajectories with random motion
-        current_points = initial_points.copy()
-        for t in range(self.sequence_length):
-            # Create frame with random background
-            frame = np.random.rand(3, H, W).astype(np.float32) * 0.3 + 0.2
-            
-            # Add some structure to background
-            y_coords, x_coords = np.meshgrid(np.arange(H), np.arange(W), indexing='ij')
-            pattern = np.sin(x_coords * 0.1) * np.cos(y_coords * 0.1) * 0.1
-            frame += pattern[np.newaxis, :, :]
-            
-            # Add point markers (small circles)
-            for point in current_points:
-                px, py = int(point[0] * W), int(point[1] * H)
-                px, py = np.clip(px, 0, W-1), np.clip(py, 0, H-1)
-                
-                # Draw small circle
-                y, x = np.ogrid[:H, :W]
-                mask = (x - px)**2 + (y - py)**2 <= 25  # radius 5
-                frame[:, mask] = 1.0  # White point
-            
-            frames.append(frame)
-            gt_trajectories.append(current_points.copy())
-            
-            # Update points with random motion
-            if t < self.sequence_length - 1:
-                velocity = np.random.randn(self.num_points, 2) * 0.02
-                current_points += velocity
-                current_points = np.clip(current_points, 0.1, 0.9)
-        
-        frames = np.stack(frames)  # (T, C, H, W)
-        gt_trajectories = np.stack(gt_trajectories)  # (T, N, 2)
-        
-        # Convert to torch
-        frames = torch.from_numpy(frames).float()
-        initial_points = torch.from_numpy(initial_points).float()
-        gt_trajectories = torch.from_numpy(gt_trajectories).float()
-        
-        return {
-            'frames': frames,
-            'initial_points': initial_points,
-            'gt_trajectories': gt_trajectories,
-            'video_name': f'synthetic_{idx}',
-            'start_idx': 0
-        }
-
