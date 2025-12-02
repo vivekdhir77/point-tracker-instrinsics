@@ -10,7 +10,7 @@ python train.py --data_root /path/to/point_odyssey_dataset
 
 ```bash
 python train.py \
-    --data_root /path/to/point_odyssey_dataset \
+    --data_root /mnt/data/vivek/point_odyssey_v1.2/train/ \
     --batch_size 8 \
     --epochs 100 \
     --lr 1e-4 \
@@ -29,7 +29,7 @@ Use a larger backbone for potentially better performance:
 
 ```bash
 python train.py \
-    --data_root /path/to/point_odyssey_dataset \
+    --data_root /mnt/data/vivek/point_odyssey_v1.2/train/ \
     --backbone resnet50
 ```
 
