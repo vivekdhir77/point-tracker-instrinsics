@@ -13,7 +13,8 @@ def visualize_attention(attention_weights_list, frames, save_path=None, layer_id
     Visualize attention weights from transformer layers
     Args:
         attention_weights_list: List of attention weights from each layer
-            Each element is (B, num_heads, N, N) where N = T * num_points
+            Each element is (B, num_heads, N, N) where N is the sequence length
+            With frame-wise temporal tokens, N = T_prev + T*(N+2) or similar
         frames: (T, C, H, W) video frames
         save_path: Path to save visualization
         layer_idx: Which layer to visualize
@@ -22,20 +23,36 @@ def visualize_attention(attention_weights_list, frames, save_path=None, layer_id
     if len(attention_weights_list) == 0:
         return
     
+    # Get attention from specified layer and head
+    if layer_idx >= len(attention_weights_list):
+        layer_idx = len(attention_weights_list) - 1
+    
     attn = attention_weights_list[layer_idx][0]  # (num_heads, N, N)
+    
+    if head_idx >= attn.shape[0]:
+        head_idx = 0
+    
     attn = attn[head_idx].detach().cpu().numpy()  # (N, N)
     
     T, C, H, W = frames.shape
-    num_points = attn.shape[0] // T
+    seq_len = attn.shape[0]
     
-    attn_reshaped = attn.reshape(T, num_points, T, num_points)
+    # With frame-wise temporal tokens, the sequence structure is:
+    # [prev_tokens..., temp_0, frame0, pts0, temp_1, frame1, pts1, ...]
+    # For training, T_prev=0, so seq_len = T*(N+2) where N is num_points
+    # We can't easily extract point-to-point attention without knowing the exact structure
     
-    temporal_attn = attn_reshaped.mean(axis=(1, 3))  # (T, T)
+    # Just visualize the full attention matrix
+    temporal_attn = attn  # Use full attention matrix
     
-    fig, axes = plt.subplots(2, T, figsize=(3*T, 6))
+    # Create a simpler visualization: frames on top, attention matrix below
+    fig, axes = plt.subplots(2, max(T, 2), figsize=(3*max(T, 2), 6))
     if T == 1:
         axes = axes.reshape(2, 1)
+    elif T == 0:
+        axes = axes.reshape(2, 2)
     
+    # Show frames
     for t in range(T):
         frame = frames[t].transpose(1, 2, 0)  # (H, W, C)
         frame = np.clip(frame, 0, 1)
@@ -43,13 +60,19 @@ def visualize_attention(attention_weights_list, frames, save_path=None, layer_id
         axes[0, t].set_title(f'Frame {t}')
         axes[0, t].axis('off')
     
-    im = axes[1, 0].imshow(temporal_attn, cmap='hot', aspect='auto')
-    axes[1, 0].set_title('Temporal Attention')
-    axes[1, 0].set_xlabel('Query Frame')
-    axes[1, 0].set_ylabel('Key Frame')
+    # Hide unused frame axes
+    for t in range(T, axes.shape[1]):
+        axes[0, t].axis('off')
+    
+    # Show full attention matrix
+    im = axes[1, 0].imshow(temporal_attn, cmap='hot', aspect='auto', interpolation='nearest')
+    axes[1, 0].set_title(f'Attention Matrix\n(seq_len={seq_len})')
+    axes[1, 0].set_xlabel('Key Position')
+    axes[1, 0].set_ylabel('Query Position')
     plt.colorbar(im, ax=axes[1, 0])
     
-    for t in range(1, T):
+    # Hide unused attention axes
+    for t in range(1, axes.shape[1]):
         axes[1, t].axis('off')
     
     plt.tight_layout()

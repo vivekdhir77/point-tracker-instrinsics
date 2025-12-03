@@ -515,7 +515,8 @@ def main():
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--sequence_length', type=int, default=8)
+    parser.add_argument('--sequence_length', type=int, default=16,
+                        help='Number of frames per sequence (default: 16, recommended: 8-16 for stability)')
     parser.add_argument('--num_points', type=int, default=8)
     parser.add_argument('--image_size', type=int, default=256)
     parser.add_argument('--num_workers', type=int, default=4)
