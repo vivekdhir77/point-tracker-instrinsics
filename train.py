@@ -92,9 +92,10 @@ def compute_ground_truth_rays(points_3d_world, camera_center):
     return rays
 
 
-def compute_loss(pred_points, gt_points, initial_points, pred_rays=None, gt_rays=None, lambda_ray=0.1):
+def compute_loss(pred_points, gt_points, initial_points, pred_rays=None, gt_rays=None, 
+                 pred_visibility=None, gt_visibility=None, lambda_ray=0.8, lambda_visibility=0.5):
     """
-    Compute tracking loss and ray prediction loss
+    Compute tracking loss, ray prediction loss, and visibility loss
     
     Args:
         pred_points: (B, T, N, 2) predicted points
@@ -102,7 +103,10 @@ def compute_loss(pred_points, gt_points, initial_points, pred_rays=None, gt_rays
         initial_points: (B, N, 2) initial points
         pred_rays: (B, T, N, 6) predicted rays in Plücker coordinates (optional)
         gt_rays: (B, T, N, 6) ground truth rays (optional)
+        pred_visibility: (B, T, N) predicted visibility probabilities (optional)
+        gt_visibility: (B, T, N) ground truth visibility (0 or 1) (optional)
         lambda_ray: weight for ray prediction loss
+        lambda_visibility: weight for visibility loss
     
     Returns:
         dict with loss tensors (using sum of absolute errors, not mean)
@@ -156,8 +160,20 @@ def compute_loss(pred_points, gt_points, initial_points, pred_rays=None, gt_rays
         # Combined ray loss
         ray_loss = direction_loss + moment_loss
     
+    # Visibility loss - binary cross-entropy
+    visibility_loss = torch.tensor(0.0, device=pred_points.device)
+    if pred_visibility is not None and gt_visibility is not None:
+        # Binary cross-entropy loss
+        # pred_visibility: (B, T, N) probabilities [0, 1]
+        # gt_visibility: (B, T, N) binary values [0, 1]
+        visibility_loss = torch.nn.functional.binary_cross_entropy(
+            pred_visibility, 
+            gt_visibility, 
+            reduction='sum'  # Sum, not mean (consistent with other losses)
+        )
+    
     # Total loss (no camera loss - it's redundant with ray loss!)
-    total_loss = l1_loss + 0.1 * temporal_loss + lambda_ray * ray_loss
+    total_loss = l1_loss + 0.1 * temporal_loss + lambda_ray * ray_loss + lambda_visibility * visibility_loss
     
     return {
         'total_loss': total_loss,
@@ -167,6 +183,7 @@ def compute_loss(pred_points, gt_points, initial_points, pred_rays=None, gt_rays
         'ray_loss': ray_loss,
         'direction_loss': direction_loss,
         'moment_loss': moment_loss,
+        'visibility_loss': visibility_loss,
     }
 
 
@@ -294,7 +311,8 @@ def train_epoch(model, dataloader, optimizer, device, epoch, save_dir, batch_los
     model.train()
     total_losses = {
         'total_loss': 0, 'l1_loss': 0, 'epe': 0, 'temporal_loss': 0,
-        'ray_loss': 0, 'direction_loss': 0, 'moment_loss': 0
+        'ray_loss': 0, 'direction_loss': 0, 'moment_loss': 0,
+        'visibility_loss': 0
     }
     num_batches = 0
     
@@ -316,7 +334,13 @@ def train_epoch(model, dataloader, optimizer, device, epoch, save_dir, batch_los
         # Extract predictions from dictionary
         pred_points = output['points']
         pred_rays = output.get('rays', None)
+        pred_visibility = output.get('visibility', None)  # (B, T, N)
         attention_weights = output.get('attention', None)
+        
+        # Get ground truth visibility
+        gt_visibility = batch.get('gt_visibilities', None)
+        if gt_visibility is not None:
+            gt_visibility = gt_visibility.to(device)  # (B, T, N)
         
         # Compute ground truth rays from 3D trajectories
         gt_rays = None
@@ -336,7 +360,10 @@ def train_epoch(model, dataloader, optimizer, device, epoch, save_dir, batch_los
             pred_points, gt_trajectories, initial_points,
             pred_rays=pred_rays, 
             gt_rays=gt_rays,
-            lambda_ray=lambda_ray
+            pred_visibility=pred_visibility,
+            gt_visibility=gt_visibility,
+            lambda_ray=lambda_ray,
+            lambda_visibility=0.1  # Weight for visibility loss
         )
         
         losses['total_loss'].backward()
@@ -360,6 +387,8 @@ def train_epoch(model, dataloader, optimizer, device, epoch, save_dir, batch_los
             postfix['ray'] = f"{losses['ray_loss'].item():.4f}"
             postfix['dir'] = f"{losses['direction_loss'].item():.4f}"
             postfix['mom'] = f"{losses['moment_loss'].item():.4f}"
+        if pred_visibility is not None:
+            postfix['vis'] = f"{losses['visibility_loss'].item():.4f}"
         pbar.set_postfix(postfix)
         
         # Visualize predictions every 50 batches
@@ -388,7 +417,8 @@ def validate(model, dataloader, device, epoch, save_dir, use_rays=False, lambda_
     model.eval()
     total_losses = {
         'total_loss': 0, 'l1_loss': 0, 'epe': 0, 'temporal_loss': 0,
-        'ray_loss': 0, 'direction_loss': 0, 'moment_loss': 0
+        'ray_loss': 0, 'direction_loss': 0, 'moment_loss': 0,
+        'visibility_loss': 0
     }
     num_batches = 0
     
@@ -414,7 +444,13 @@ def validate(model, dataloader, device, epoch, save_dir, use_rays=False, lambda_
             # Extract predictions from dictionary
             pred_points = output['points']
             pred_rays = output.get('rays', None)
+            pred_visibility = output.get('visibility', None)  # (B, T, N)
             attention_weights = output.get('attention', None)
+            
+            # Get ground truth visibility
+            gt_visibility = batch.get('gt_visibilities', None)
+            if gt_visibility is not None:
+                gt_visibility = gt_visibility.to(device)  # (B, T, N)
             
             # Compute ground truth rays from 3D trajectories
             gt_rays = None
@@ -434,7 +470,10 @@ def validate(model, dataloader, device, epoch, save_dir, use_rays=False, lambda_
                 pred_points, gt_trajectories, initial_points,
                 pred_rays=pred_rays,
                 gt_rays=gt_rays,
-                lambda_ray=lambda_ray
+                pred_visibility=pred_visibility,
+                gt_visibility=gt_visibility,
+                lambda_ray=lambda_ray,
+                lambda_visibility=0.1  # Weight for visibility loss
             )
             
             num_batches = accumulate_losses(total_losses, losses, num_batches)
@@ -611,10 +650,14 @@ def main():
         if args.use_rays:
             print(f'  Train Ray Loss: {train_losses["ray_loss"]:.4f} '
                   f'(dir: {train_losses["direction_loss"]:.4f}, mom: {train_losses["moment_loss"]:.4f})')
+        if 'visibility_loss' in train_losses and train_losses['visibility_loss'] > 0:
+            print(f'  Train Visibility Loss: {train_losses["visibility_loss"]:.4f}')
         print(f'  Val Loss: {val_losses["total_loss"]:.4f}, EPE: {val_losses["epe"]:.4f}')
         if args.use_rays:
             print(f'  Val Ray Loss: {val_losses["ray_loss"]:.4f} '
                   f'(dir: {val_losses["direction_loss"]:.4f}, mom: {val_losses["moment_loss"]:.4f})')
+        if 'visibility_loss' in val_losses and val_losses['visibility_loss'] > 0:
+            print(f'  Val Visibility Loss: {val_losses["visibility_loss"]:.4f}')
         
         checkpoint = {
             'epoch': epoch,

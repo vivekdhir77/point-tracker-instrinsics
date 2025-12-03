@@ -138,14 +138,12 @@ class PointTracker(nn.Module):
         dropout=0.1,
         backbone='resnet18',
         pretrained=True,
-        use_correlation_matching=True,  # Use correlation-based feature matching
-        search_radius=4  # Search radius for correlation matching
+        search_radius=4  # Search radius for cosine similarity matching
     ):
         super().__init__()
         self.num_points = num_points
         self.feature_dim = feature_dim
         self.hidden_dim = hidden_dim
-        self.use_correlation_matching = use_correlation_matching
         self.search_radius = search_radius
         
         # Feature extractor with pre-trained backbone
@@ -165,16 +163,6 @@ class PointTracker(nn.Module):
         # Learnable temporal token (one per frame) to aggregate frame-level information
         self.temporal_token = nn.Parameter(torch.randn(1, 1, hidden_dim))
         nn.init.normal_(self.temporal_token, mean=0, std=0.02)
-        
-        # Correlation volume projection (if using correlation matching)
-        if use_correlation_matching:
-            corr_channels = (2 * search_radius + 1) ** 2
-            self.corr_proj = nn.Sequential(
-                nn.Linear(corr_channels, hidden_dim // 2),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden_dim // 2, hidden_dim)  # Project to full hidden_dim
-            )
         
         # Tracking head for iterative point tracking (used for frames [0, T-1])
         self.tracking_head = nn.Sequential(
@@ -198,18 +186,39 @@ class PointTracker(nn.Module):
             nn.Linear(hidden_dim // 2, 2)  # Predict (x, y) offset
         )
         
-        # Ray prediction head for all tracked points (predicts 6D Plücker coordinates)
-        # Plücker coordinates: (direction d: 3D, moment m: 3D) where m = p × d
-        self.ray_head = nn.Sequential(
+        # Visibility prediction head
+        self.visibility_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, hidden_dim // 4),
-            nn.LayerNorm(hidden_dim // 4),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 4, 6),  # 6D Plücker coordinates: [d_x, d_y, d_z, m_x, m_y, m_z]
+            nn.Linear(hidden_dim // 2, 1),  # Predict visibility (0 or 1)
+            nn.Sigmoid()  # Output probability [0, 1]
+        )
+        
+        # Ray prediction head using CNN (predicts 6D Plücker coordinates)
+        # Plücker coordinates: (direction d: 3D, moment m: 3D) where m = p × d
+        # Input: concatenated point features + frame features (2 * hidden_dim)
+        # Process features as 2D: (B, channels, T, N) where T is temporal and N is spatial (points)
+        self.ray_head = nn.Sequential(
+            # First conv: reduce channels and process spatial-temporal patterns
+            nn.Conv2d(2 * hidden_dim, hidden_dim, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(dropout),
+            
+            # Second conv: further processing
+            nn.Conv2d(hidden_dim, hidden_dim // 2, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden_dim // 2),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(dropout),
+            
+            # Third conv: final processing
+            nn.Conv2d(hidden_dim // 2, hidden_dim // 4, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden_dim // 4),
+            nn.ReLU(inplace=True),
+            
+            # Final conv: output 6 channels (Plücker coordinates)
+            nn.Conv2d(hidden_dim // 4, 6, kernel_size=1),  # 6D Plücker coordinates: [d_x, d_y, d_z, m_x, m_y, m_z]
         )
         
     def extract_point_features(self, features, points):
@@ -310,48 +319,51 @@ class PointTracker(nn.Module):
         
         return window_features
     
-    def compute_correlation_volume(self, feat_source, feat_target, points_source, search_radius=6):
+    def compute_cosine_similarity_matching(self, source_features, target_feat_map, points_source, search_radius=6):
         """
-        Compute correlation volume between source point features and target frame features
-        This allows the model to search for the point in a local neighborhood
+        Compute cosine similarity between source point features and target frame features in a search region
+        This finds the best matching location in the target frame based on feature similarity
         
         Args:
-            feat_source: (B, C, H, W) source frame features
-            feat_target: (B, C, H, W) target frame features
-            points_source: (B, N, 2) point locations in source frame [0, 1]
+            source_features: (B, N, hidden_dim) source point features (from transformer)
+            target_feat_map: (B, C_feat, H, W) target frame feature map
+            points_source: (B, N, 2) point locations in source frame [0, 1] (normalized)
             search_radius: radius of search window in pixels
         Returns:
-            correlation_volume: (B, N, (2*search_radius+1)^2) correlation scores
-            offset_coords: (B, N, (2*search_radius+1)^2, 2) corresponding offset coordinates
+            best_offsets: (B, N, 2) best matching offsets in pixels
+            similarity_scores: (B, N, search_area) similarity scores for all candidates
         """
-        B, C, H, W = feat_source.shape
-        N = points_source.shape[1]
+        B, N, hidden_dim = source_features.shape
+        B_t, C_feat, H, W = target_feat_map.shape
+        assert B == B_t, "Batch sizes must match"
         
-        # Extract source point features
-        points_expanded = points_source.unsqueeze(1)  # (B, 1, N, 2)
-        feat_source_expanded = feat_source.unsqueeze(1)  # (B, 1, C, H, W)
-        source_point_features = self.extract_point_features(
-            feat_source_expanded,
-            points_expanded
-        ).squeeze(1)  # (B, N, C)
+        # Normalize source features for cosine similarity
+        source_features_norm = F.normalize(source_features, dim=2)  # (B, N, hidden_dim)
         
         # Convert points to pixel coordinates
         points_y = points_source[:, :, 1] * H  # (B, N)
         points_x = points_source[:, :, 0] * W  # (B, N)
         
         # Create search grid
-        search_range = torch.arange(-search_radius, search_radius + 1, device=feat_source.device)
+        search_range = torch.arange(-search_radius, search_radius + 1, device=target_feat_map.device, dtype=torch.float32)
         grid_y, grid_x = torch.meshgrid(search_range, search_range, indexing='ij')
         grid_offsets = torch.stack([grid_x.flatten(), grid_y.flatten()], dim=-1)  # (search_area, 2)
         search_area = grid_offsets.shape[0]
         
-        # Compute correlation for each point
-        correlations = []
-        offset_coords_list = []
+        # Project target feature map to hidden_dim for comparison
+        # Reshape for projection: (B, C_feat, H, W) -> (B*H*W, C_feat)
+        B_t, C_feat, H_t, W_t = target_feat_map.shape
+        target_feat_flat = target_feat_map.permute(0, 2, 3, 1).reshape(B_t * H_t * W_t, C_feat)  # (B*H*W, C_feat)
+        target_feat_proj = self.point_feat_proj(target_feat_flat)  # (B*H*W, hidden_dim)
+        target_feat_proj = target_feat_proj.reshape(B_t, H_t, W_t, hidden_dim).permute(0, 3, 1, 2)  # (B, hidden_dim, H, W)
+        
+        # Compute similarity for each point
+        best_offsets_list = []
+        similarity_scores_list = []
         
         for b in range(B):
-            point_correlations = []
             point_offsets = []
+            point_similarities = []
             
             for n in range(N):
                 # Get candidate positions
@@ -359,7 +371,7 @@ class PointTracker(nn.Module):
                 candidate_x = center_x + grid_offsets[:, 0]  # (search_area,)
                 candidate_y = center_y + grid_offsets[:, 1]  # (search_area,)
                 
-                # Normalize to [-1, 1]
+                # Normalize to [-1, 1] for grid_sample
                 candidate_x_norm = (candidate_x / W) * 2 - 1
                 candidate_y_norm = (candidate_y / H) * 2 - 1
                 
@@ -367,32 +379,37 @@ class PointTracker(nn.Module):
                 sampling_grid = torch.stack([candidate_x_norm, candidate_y_norm], dim=-1)  # (search_area, 2)
                 sampling_grid = sampling_grid.unsqueeze(0).unsqueeze(0)  # (1, 1, search_area, 2)
                 
-                # Sample features
+                # Sample features from target frame
                 target_features = F.grid_sample(
-                    feat_target[b:b+1],
+                    target_feat_proj[b:b+1],
                     sampling_grid,
                     mode='bilinear',
                     padding_mode='zeros',
                     align_corners=True
-                )  # (1, C, 1, search_area)
-                target_features = target_features.squeeze(2).squeeze(0).transpose(0, 1)  # (search_area, C)
+                )  # (1, hidden_dim, 1, search_area)
+                target_features = target_features.squeeze(2).squeeze(0).transpose(0, 1)  # (search_area, hidden_dim)
                 
-                # Compute correlation (cosine similarity)
-                source_feat = source_point_features[b, n, :].unsqueeze(0)  # (1, C)
-                source_feat_norm = F.normalize(source_feat, dim=1)
-                target_feat_norm = F.normalize(target_features, dim=1)
-                correlation = torch.sum(source_feat_norm * target_feat_norm, dim=1)  # (search_area,)
+                # Normalize target features
+                target_features_norm = F.normalize(target_features, dim=1)  # (search_area, hidden_dim)
                 
-                point_correlations.append(correlation)
-                point_offsets.append(grid_offsets)
+                # Compute cosine similarity
+                source_feat = source_features_norm[b, n, :].unsqueeze(0)  # (1, hidden_dim)
+                similarity = torch.sum(source_feat * target_features_norm, dim=1)  # (search_area,)
+                
+                # Find best match
+                best_idx = torch.argmax(similarity, dim=0)
+                best_offset = grid_offsets[best_idx]  # (2,)
+                
+                point_offsets.append(best_offset)
+                point_similarities.append(similarity)
             
-            correlations.append(torch.stack(point_correlations, dim=0))  # (N, search_area)
-            offset_coords_list.append(torch.stack(point_offsets, dim=0))  # (N, search_area, 2)
+            best_offsets_list.append(torch.stack(point_offsets, dim=0))  # (N, 2)
+            similarity_scores_list.append(torch.stack(point_similarities, dim=0))  # (N, search_area)
         
-        correlation_volume = torch.stack(correlations, dim=0)  # (B, N, search_area)
-        offset_coords = torch.stack(offset_coords_list, dim=0)  # (B, N, search_area, 2)
+        best_offsets = torch.stack(best_offsets_list, dim=0)  # (B, N, 2)
+        similarity_scores = torch.stack(similarity_scores_list, dim=0)  # (B, N, search_area)
         
-        return correlation_volume, offset_coords
+        return best_offsets, similarity_scores
     
     def get_sinusoidal_positional_encoding(self, positions, d_model):
         """
@@ -733,6 +750,8 @@ class PointTracker(nn.Module):
         tracked_points = initial_points.unsqueeze(1)  # (B, 1, N, 2)
         
         # Track points frame by frame with full transformer processing
+        # Store transformer output from last iteration for reuse in refinement
+        x_all_frames_processed = None
         for t in range(T - 1):
             
             # Extract features for all tracked frames [0, t]
@@ -754,36 +773,14 @@ class PointTracker(nn.Module):
             # Use last tracked points as starting point for next frame
             last_points = tracked_points[:, -1, :, :]  # (B, N, 2)
             
-            # Extract features for next frame using correlation-based matching or simple sampling
-            if self.use_correlation_matching:
-                # Compute correlation volume to handle position uncertainty
-                correlation_volume, offset_coords = self.compute_correlation_volume(
-                    frame_feat_current,
-                    frame_feat_next,
-                    last_points,
-                    search_radius=self.search_radius
-                )  # (B, N, search_area), (B, N, search_area, 2)
-                
-                # Project correlation volume to feature space
-                corr_features = self.corr_proj(correlation_volume)  # (B, N, hidden_dim)
-                
-                # Also extract point features at predicted location
-                frame_feat_next_expanded = frame_feat_next.unsqueeze(1)  # (B, 1, C_feat, H_feat, W_feat)
-                last_points_expanded = last_points.unsqueeze(1)  # (B, 1, N, 2)
-                point_feat_next = self.extract_point_features(
-                    frame_feat_next_expanded, 
-                    last_points_expanded
-                )  # (B, 1, N, C_feat)
-                point_feat_next_flat = point_feat_next.reshape(B, N, self.feature_dim)
-            else:
-                # Simple feature extraction at predicted location
-                frame_feat_next_expanded = frame_feat_next.unsqueeze(1)  # (B, 1, C_feat, H_feat, W_feat)
-                last_points_expanded = last_points.unsqueeze(1)  # (B, 1, N, 2)
-                point_feat_next = self.extract_point_features(
-                    frame_feat_next_expanded, 
-                    last_points_expanded
-                )  # (B, 1, N, C_feat)
-                point_feat_next_flat = point_feat_next.reshape(B, N, self.feature_dim)
+            # Extract point features at predicted location for next frame
+            frame_feat_next_expanded = frame_feat_next.unsqueeze(1)  # (B, 1, C_feat, H_feat, W_feat)
+            last_points_expanded = last_points.unsqueeze(1)  # (B, 1, N, 2)
+            point_feat_next = self.extract_point_features(
+                frame_feat_next_expanded, 
+                last_points_expanded
+            )  # (B, 1, N, C_feat)
+            point_feat_next_flat = point_feat_next.reshape(B, N, self.feature_dim)
             
             # Flatten temporal and point dimensions for history
             point_features_history_flat = point_features_history.reshape(B, num_tracked_frames * N, self.feature_dim)
@@ -792,76 +789,112 @@ class PointTracker(nn.Module):
             point_feat_history_proj = self.point_feat_proj(point_features_history_flat)  # (B, (t+1)*N, hidden_dim)
             point_feat_next_proj = self.point_feat_proj(point_feat_next_flat)  # (B, N, hidden_dim)
             
-            # Add correlation features if using correlation matching
-            if self.use_correlation_matching:
-                # Add correlation features to visual features
-                # Both are now hidden_dim size, so we can add directly
-                point_feat_next_proj = point_feat_next_proj + corr_features  # (B, N, hidden_dim)
-            
-            # Add point coordinate embeddings
-            point_coords_history = points_history.reshape(B, num_tracked_frames * N, 2)
-            point_embeds_history = self.point_embed(point_coords_history)  # (B, (t+1)*N, hidden_dim)
-            point_embeds_next = self.point_embed(last_points)  # (B, N, hidden_dim)
-            
             # Add sinusoidal temporal positional encodings
-            temporal_positions_history = torch.arange(num_tracked_frames, device=frames.device).unsqueeze(1).repeat(1, N).reshape(1, -1).repeat(B, 1)
-            temporal_embeds_history = self.get_sinusoidal_positional_encoding(
-                temporal_positions_history, self.hidden_dim
-            )  # (B, (t+1)*N, hidden_dim)
+            # Compute positions for all frames together (0 to t+1)
+            temporal_positions = torch.arange(num_tracked_frames + 1, device=frames.device).unsqueeze(1).repeat(1, N).reshape(1, -1).repeat(B, 1)  # (B, (t+2)*N)
+            temporal_embeds_all = self.get_sinusoidal_positional_encoding(
+                temporal_positions, self.hidden_dim
+            )  # (B, (t+2)*N, hidden_dim)
             
-            temporal_positions_next = torch.full((B, N), t+1, device=frames.device)
-            temporal_embeds_next = self.get_sinusoidal_positional_encoding(
-                temporal_positions_next, self.hidden_dim
-            )  # (B, N, hidden_dim)
+            # Split into history and next
+            temporal_embeds_history = temporal_embeds_all[:, :num_tracked_frames * N]  # (B, (t+1)*N, hidden_dim)
+            temporal_embeds_next = temporal_embeds_all[:, num_tracked_frames * N:]  # (B, N, hidden_dim)
             
-            # Combine all features: visual features + point embeddings + temporal embeddings
-            x_history = point_feat_history_proj + point_embeds_history + temporal_embeds_history  # (B, (t+1)*N, hidden_dim)
-            x_next = point_feat_next_proj + point_embeds_next + temporal_embeds_next  # (B, N, hidden_dim)
+            # Combine all features: visual features + temporal embeddings
+            x_history = point_feat_history_proj + temporal_embeds_history  # (B, (t+1)*N, hidden_dim)
+            x_next = point_feat_next_proj + temporal_embeds_next  # (B, N, hidden_dim)
             
             # Reshape to separate frames: (B, num_frames, N, hidden_dim)
             x_history_frames = x_history.reshape(B, num_tracked_frames, N, self.hidden_dim)
             x_next_frame = x_next.unsqueeze(1)  # (B, 1, N, hidden_dim)
             
-            # Create temporal tokens for each frame
-            temporal_tokens_history = self.temporal_token.expand(B, num_tracked_frames, -1)  # (B, t+1, hidden_dim)
-            temporal_token_next = self.temporal_token.expand(B, 1, -1)  # (B, 1, hidden_dim)
+            # Create temporal tokens for all frames together
+            temporal_tokens_all = self.temporal_token.expand(B, num_tracked_frames + 1, -1)  # (B, t+2, hidden_dim)
             
-            # Add temporal positional encoding to temporal tokens
-            temporal_pos_tokens_history = torch.arange(num_tracked_frames, device=frames.device).unsqueeze(0).repeat(B, 1)  # (B, t+1)
-            temporal_embed_tokens_history = self.get_sinusoidal_positional_encoding(
-                temporal_pos_tokens_history, self.hidden_dim
-            )  # (B, t+1, hidden_dim)
-            temporal_tokens_history = temporal_tokens_history + temporal_embed_tokens_history
+            # Add temporal positional encoding to temporal tokens (0 to t+1)
+            temporal_pos_tokens_all = torch.arange(num_tracked_frames + 1, device=frames.device).unsqueeze(0).repeat(B, 1)  # (B, t+2)
+            temporal_embed_tokens_all = self.get_sinusoidal_positional_encoding(
+                temporal_pos_tokens_all, self.hidden_dim
+            )  # (B, t+2, hidden_dim)
+            temporal_tokens_all = temporal_tokens_all + temporal_embed_tokens_all
             
-            temporal_pos_token_next = torch.full((B, 1), t+1, dtype=torch.long, device=frames.device)  # (B, 1)
-            temporal_embed_token_next = self.get_sinusoidal_positional_encoding(
-                temporal_pos_token_next, self.hidden_dim
-            )  # (B, 1, hidden_dim)
-            temporal_token_next = temporal_token_next + temporal_embed_token_next
+            # Split into history and next
+            temporal_tokens_history = temporal_tokens_all[:, :num_tracked_frames]  # (B, t+1, hidden_dim)
+            temporal_token_next = temporal_tokens_all[:, num_tracked_frames:num_tracked_frames+1]  # (B, 1, hidden_dim)
             
-            # Interleave temporal tokens with point tokens
-            # For each frame: [temporal_token, point1, point2, ..., pointN]
+            # Extract global frame-level features via global max pooling (PointNet-style)
+            # frame_feat_history: (B, t+1, C_feat, H_feat, W_feat)
+            B_frames, T_frames, C_frames, H_frames, W_frames = frame_feat_history.shape
+            frame_feat_history_flat = frame_feat_history.reshape(B_frames * T_frames, C_frames, H_frames, W_frames)
+            # Global max pooling: (B*T, C_feat, H, W) -> (B*T, C_feat, 1, 1) -> (B*T, C_feat)
+            frame_feat_global = F.adaptive_max_pool2d(frame_feat_history_flat, (1, 1)).squeeze(-1).squeeze(-1)  # (B*T, C_feat)
+            frame_feat_global = frame_feat_global.reshape(B_frames, T_frames, C_frames)  # (B, t+1, C_feat)
+            # Project to hidden dimension
+            frame_feat_global_proj = self.point_feat_proj(frame_feat_global)  # (B, t+1, hidden_dim)
+            
+            # Extract global frame feature for next frame
+            frame_feat_next_global = F.adaptive_max_pool2d(frame_feat_next, (1, 1)).squeeze(-1).squeeze(-1)  # (B, C_feat)
+            frame_feat_next_global_proj = self.point_feat_proj(frame_feat_next_global)  # (B, hidden_dim)
+            frame_feat_next_global_proj = frame_feat_next_global_proj.unsqueeze(1)  # (B, 1, hidden_dim)
+            
+            # Interleave temporal tokens, frame features, and point tokens
+            # For each frame: [temporal_token, frame_feature, point1, point2, ..., pointN]
             x_history_with_tokens = []
             for i in range(num_tracked_frames):
                 x_history_with_tokens.append(temporal_tokens_history[:, i:i+1, :])  # Temporal token
+                x_history_with_tokens.append(frame_feat_global_proj[:, i:i+1, :])  # Frame feature
                 x_history_with_tokens.append(x_history_frames[:, i, :, :])  # N point tokens
-            x_history_seq = torch.cat(x_history_with_tokens, dim=1)  # (B, (t+1)*(N+1), hidden_dim)
+            x_history_seq = torch.cat(x_history_with_tokens, dim=1)  # (B, (t+1)*(N+2), hidden_dim)
             
-            x_next_with_token = torch.cat([temporal_token_next, x_next_frame.squeeze(1)], dim=1)  # (B, N+1, hidden_dim)
+            x_next_with_token = torch.cat([
+                temporal_token_next, 
+                frame_feat_next_global_proj, 
+                x_next_frame.squeeze(1)
+            ], dim=1)  # (B, N+2, hidden_dim)
             
             # Concatenate history and next frame features
-            x = torch.cat([x_history_seq, x_next_with_token], dim=1)  # (B, (t+2)*(N+1), hidden_dim)
+            x = torch.cat([x_history_seq, x_next_with_token], dim=1)  # (B, (t+2)*(N+2), hidden_dim)
             
             # Process through transformer layers with attention
             for layer in self.transformer_layers:
                 x, _ = layer(x)
             
-            # Extract features for the next frame (last N tokens = point tokens only)
+            # Extract features for the last frame's points (from history) and next frame's points
+            # History sequence structure: [temp0, frame0, pts0, temp1, frame1, pts1, ..., temp_t, frame_t, pts_t]
+            # Next frame structure: [temp_next, frame_next, pts_next]
+            # Extract last frame's point features from transformer output
+            last_frame_idx = num_tracked_frames - 1
+            last_frame_start = last_frame_idx * (N + 2) + 2  # Skip temporal token and frame feature
+            last_frame_end = last_frame_start + N
+            x_last_frame_points = x[:, last_frame_start:last_frame_end, :]  # (B, N, hidden_dim)
+            
+            # Extract next frame's point features (last N tokens)
             x_next_out = x[:, -N:, :]  # (B, N, hidden_dim) - last N tokens are the point tokens
             
-            # Predict offset for next frame using tracking head
-            offset = self.tracking_head(x_next_out)  # (B, N, 2)
-            next_points = last_points + offset
+            # Use cosine similarity to find best matches in next frame
+            # Get feature map dimensions
+            _, _, H_feat, W_feat = frame_feat_next.shape
+            
+            # Compute cosine similarity matching between last frame points and next frame
+            best_offsets_pixels, similarity_scores = self.compute_cosine_similarity_matching(
+                x_last_frame_points,  # (B, N, hidden_dim) - features from last frame after transformer
+                frame_feat_next,  # (B, C_feat, H_feat, W_feat) - next frame feature map
+                last_points,  # (B, N, 2) - last tracked point locations
+                search_radius=self.search_radius
+            )  # (B, N, 2) offsets in pixels, (B, N, search_area) similarity scores
+            
+            # Convert pixel offsets to normalized coordinates [0, 1]
+            # best_offsets_pixels: (B, N, 2) in feature map pixels
+            # Convert to normalized coordinates relative to feature map (which maps to original image space)
+            offset_normalized = best_offsets_pixels / torch.tensor([W_feat, H_feat], device=best_offsets_pixels.device, dtype=torch.float32).unsqueeze(0).unsqueeze(0)  # (B, N, 2)
+            
+            # Compute next points: last_points + offset (in normalized coordinates)
+            next_points = last_points + offset_normalized
+            
+            # Optionally refine using tracking head on the matched features
+            # This can help refine the match or handle cases where similarity matching fails
+            offset_refinement = self.tracking_head(x_next_out)  # (B, N, 2)
+            next_points = next_points + offset_refinement * 0.1  # Small refinement (10% weight)
             
             # Append to tracked points
             tracked_points = torch.cat([tracked_points, next_points.unsqueeze(1)], dim=1)  # (B, t+2, N, 2)
@@ -869,11 +902,13 @@ class PointTracker(nn.Module):
         # Now we have tracked points for frames [0, T-1] (T frames total)
         # tracked_points: (B, T, N, 2)
         
-        # For final prediction, extract features for all frames including the last one
-        # Extract point features for all tracked frames [0, T-1]
+        # Refinement: refine predictions once
+        predicted_points = tracked_points  # Start with initial tracked points
+        
+        # Extract point features for current predictions
         point_features_all = self.extract_point_features(
             frame_features, 
-            tracked_points
+            predicted_points
         )  # (B, T, N, C_feat)
         
         # Flatten temporal and point dimensions
@@ -882,10 +917,6 @@ class PointTracker(nn.Module):
         # Project to hidden dimension
         point_feat_all_proj = self.point_feat_proj(point_features_all_flat)  # (B, T*N, hidden_dim)
         
-        # Add point coordinate embeddings
-        point_coords_all = tracked_points.reshape(B, T * N, 2)  # (B, T*N, 2)
-        point_embeds_all = self.point_embed(point_coords_all)  # (B, T*N, hidden_dim)
-        
         # Add sinusoidal temporal positional encodings
         temporal_positions_all = torch.arange(T, device=frames.device).unsqueeze(1).repeat(1, N).reshape(1, -1).repeat(B, 1)  # (B, T*N)
         temporal_embeds_all = self.get_sinusoidal_positional_encoding(
@@ -893,7 +924,7 @@ class PointTracker(nn.Module):
         )  # (B, T*N, hidden_dim)
         
         # Combine all features
-        x_all = point_feat_all_proj + point_embeds_all + temporal_embeds_all  # (B, T*N, hidden_dim)
+        x_all = point_feat_all_proj + temporal_embeds_all  # (B, T*N, hidden_dim)
         
         # Reshape to separate frames
         x_all_frames = x_all.reshape(B, T, N, self.hidden_dim)  # (B, T, N, hidden_dim)
@@ -908,48 +939,79 @@ class PointTracker(nn.Module):
         )  # (B, T, hidden_dim)
         temporal_tokens_all = temporal_tokens_all + temporal_embed_tokens_all
         
-        # Interleave temporal tokens with point tokens
-        # For each frame: [temporal_token, point1, point2, ..., pointN]
+        # Extract global frame-level features via global max pooling (PointNet-style)
+        # frame_features: (B, T, C_feat, H_feat, W_feat)
+        B_frames, T_frames, C_frames, H_frames, W_frames = frame_features.shape
+        frame_features_flat = frame_features.reshape(B_frames * T_frames, C_frames, H_frames, W_frames)
+        # Global max pooling: (B*T, C_feat, H, W) -> (B*T, C_feat, 1, 1) -> (B*T, C_feat)
+        frame_feat_global_all = F.adaptive_max_pool2d(frame_features_flat, (1, 1)).squeeze(-1).squeeze(-1)  # (B*T, C_feat)
+        frame_feat_global_all = frame_feat_global_all.reshape(B_frames, T_frames, C_frames)  # (B, T, C_feat)
+        # Project to hidden dimension
+        frame_feat_global_all_proj = self.point_feat_proj(frame_feat_global_all)  # (B, T, hidden_dim)
+        
+        # Interleave temporal tokens, frame features, and point tokens
+        # For each frame: [temporal_token, frame_feature, point1, point2, ..., pointN]
         x_with_tokens = []
         for i in range(T):
             x_with_tokens.append(temporal_tokens_all[:, i:i+1, :])  # Temporal token
+            x_with_tokens.append(frame_feat_global_all_proj[:, i:i+1, :])  # Frame feature
             x_with_tokens.append(x_all_frames[:, i, :, :])  # N point tokens
-        x = torch.cat(x_with_tokens, dim=1)  # (B, T*(N+1), hidden_dim)
+        x = torch.cat(x_with_tokens, dim=1)  # (B, T*(N+2), hidden_dim)
         
-        # Final refinement pass through transformer with full temporal context
-        attention_weights_list = []
+        # Refinement pass through transformer
         for layer in self.transformer_layers:
-            x, attn_weights = layer(x)
-            attention_weights_list.append(attn_weights)
+            x, _ = layer(x)
         
-        # Extract only point tokens (skip temporal tokens) and reshape
-        # Sequence is: [temp0, pt0_0, ..., pt0_N-1, temp1, pt1_0, ..., pt1_N-1, ...]
+        # Extract only point tokens (skip temporal tokens and frame features) and reshape
+        # Sequence is: [temp0, frame0, pt0_0, ..., pt0_N-1, temp1, frame1, pt1_0, ..., pt1_N-1, ...]
         x_points_only = []
         for i in range(T):
-            start_idx = i * (N + 1) + 1  # Skip temporal token
+            start_idx = i * (N + 2) + 2  # Skip temporal token (pos 0) and frame feature (pos 1)
             end_idx = start_idx + N
             x_points_only.append(x[:, start_idx:end_idx, :])  # (B, N, hidden_dim)
         x_points = torch.stack(x_points_only, dim=1)  # (B, T, N, hidden_dim)
         
-        # Refine all tracked points using the output head
+        # Predict refinement offsets and visibility
         x_flat_for_pred = x_points.reshape(B * T, N, self.hidden_dim)  # (B*T, N, hidden_dim)
-        
-        # Predict offsets for all frames
         offsets_all = self.output_head(x_flat_for_pred)  # (B*T, N, 2)
         offsets_all = offsets_all.reshape(B, T, N, 2)  # (B, T, N, 2)
         
-        # Add offsets to tracked points to get refined predictions
-        predicted_points = tracked_points + offsets_all  # (B, T, N, 2)
+        # Predict visibility
+        visibility_all = self.visibility_head(x_flat_for_pred)  # (B*T, N, 1)
+        visibility_all = visibility_all.reshape(B, T, N)  # (B, T, N) - visibility probability
+        
+        # Apply refinement: add offsets to current predictions
+        predicted_points = predicted_points + offsets_all  # (B, T, N, 2)
         
         # Predict rays for all points across all frames (Plücker coordinates)
         predicted_rays = None
         camera_params = None
         
         if return_rays or return_camera:
-            # Use only point features (not temporal tokens) for ray prediction
-            x_points_flat = x_points.reshape(B * T * N, self.hidden_dim)  # (B*T*N, hidden_dim)
-            ray_plucker = self.ray_head(x_points_flat)  # (B*T*N, 6) - Plücker coords [d, m]
-            predicted_rays = ray_plucker.reshape(B, T, N, 6)  # (B, T, N, 6)
+            # Extract frame features from transformer output
+            # Sequence structure: [temp0, frame0, pts0, temp1, frame1, pts1, ...]
+            x_frame_features = []
+            for i in range(T):
+                frame_idx = i * (N + 2) + 1  # Frame feature position (skip temporal token)
+                x_frame_features.append(x[:, frame_idx:frame_idx+1, :])  # (B, 1, hidden_dim)
+            x_frame_features = torch.stack(x_frame_features, dim=1)  # (B, T, 1, hidden_dim)
+            
+            # Broadcast frame features to all points in each frame: (B, T, 1, hidden_dim) -> (B, T, N, hidden_dim)
+            x_frame_features_broadcast = x_frame_features.expand(-1, -1, N, -1)  # (B, T, N, hidden_dim)
+            
+            # Combine point features and frame features
+            # Concatenate for richer representation
+            x_combined = torch.cat([x_points, x_frame_features_broadcast], dim=-1)  # (B, T, N, 2*hidden_dim)
+            
+            # Reshape for CNN: (B, T, N, channels) -> (B, channels, T, N)
+            # This treats T as height (temporal) and N as width (spatial/points)
+            x_combined_cnn = x_combined.permute(0, 3, 1, 2)  # (B, 2*hidden_dim, T, N)
+            
+            # Process through CNN ray head
+            ray_plucker = self.ray_head(x_combined_cnn)  # (B, 6, T, N) - Plücker coords [d, m]
+            
+            # Reshape back: (B, 6, T, N) -> (B, T, N, 6)
+            predicted_rays = ray_plucker.permute(0, 2, 3, 1)  # (B, T, N, 6)
             
             # Normalize ray directions
             ray_directions = predicted_rays[..., :3]  # (B, T, N, 3)
@@ -1002,6 +1064,7 @@ class PointTracker(nn.Module):
         # Return results as dictionary for cleaner API
         results = {
             'points': predicted_points,  # Always returned: (B, T, N, 2)
+            'visibility': visibility_all,  # Always returned: (B, T, N) - visibility probability
         }
         
         if return_rays:
