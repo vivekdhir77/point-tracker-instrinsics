@@ -46,22 +46,26 @@ def visualize_attention(attention_weights_list, frames, save_path=None, layer_id
     temporal_attn = attn  # Use full attention matrix
     
     # Create a simpler visualization: frames on top, attention matrix below
-    fig, axes = plt.subplots(2, max(T, 2), figsize=(3*max(T, 2), 6))
+    num_cols = max(T, 2)
+    fig, axes = plt.subplots(2, num_cols, figsize=(3*num_cols, 6))
     if T == 1:
         axes = axes.reshape(2, 1)
     elif T == 0:
         axes = axes.reshape(2, 2)
+    else:
+        axes = axes.reshape(2, num_cols)
     
     # Show frames
     for t in range(T):
-        frame = frames[t].transpose(1, 2, 0)  # (H, W, C)
-        frame = np.clip(frame, 0, 1)
-        axes[0, t].imshow(frame)
-        axes[0, t].set_title(f'Frame {t}')
-        axes[0, t].axis('off')
+        if t < num_cols:
+            frame = frames[t].transpose(1, 2, 0)  # (H, W, C)
+            frame = np.clip(frame, 0, 1)
+            axes[0, t].imshow(frame)
+            axes[0, t].set_title(f'Frame {t}')
+            axes[0, t].axis('off')
     
     # Hide unused frame axes
-    for t in range(T, axes.shape[1]):
+    for t in range(T, num_cols):
         axes[0, t].axis('off')
     
     # Show full attention matrix
@@ -72,7 +76,7 @@ def visualize_attention(attention_weights_list, frames, save_path=None, layer_id
     plt.colorbar(im, ax=axes[1, 0])
     
     # Hide unused attention axes
-    for t in range(1, axes.shape[1]):
+    for t in range(1, num_cols):
         axes[1, t].axis('off')
     
     plt.tight_layout()
