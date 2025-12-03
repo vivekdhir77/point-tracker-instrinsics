@@ -218,7 +218,7 @@ def select_points_interactive(first_frame, num_points=8, image_size=(256, 256)):
 
 
 def visualize_tracking_results(frames, predicted_points, query_points, save_path, 
-                               frame_names=None, show_trails=True):
+                               frame_names=None, show_trails=True, predicted_visibility=None):
     """
     Visualize tracking results across all frames
     
@@ -229,6 +229,7 @@ def visualize_tracking_results(frames, predicted_points, query_points, save_path
         save_path: path to save visualization
         frame_names: list of frame names
         show_trails: whether to show point trails
+        predicted_visibility: (T, N) predicted visibility probabilities (optional)
     """
     T, C, H, W = frames.shape
     N = predicted_points.shape[1]
@@ -263,21 +264,44 @@ def visualize_tracking_results(frames, predicted_points, query_points, save_path
         points_pixel = points_t * np.array([W, H])
         
         for n in range(N):
+            # Get visibility for this point at this frame
+            visibility = predicted_visibility[t, n] if predicted_visibility is not None else 1.0
+            visibility_threshold = 0.5  # Points below this are considered invisible
+            
+            # Adjust alpha and style based on visibility
+            point_alpha = max(0.3, visibility)  # At least 30% visible even if low
+            trail_alpha = max(0.2, visibility * 0.6)  # Trails fade more
+            
+            # Use gray color for invisible points
+            if visibility < visibility_threshold:
+                point_color = 'gray'
+                marker_style = 'x'  # Use X for invisible points
+                marker_size = 8
+            else:
+                point_color = colors[n]
+                marker_style = 'o'
+                marker_size = 10
+            
             # Plot current point
             ax.plot(points_pixel[n, 0], points_pixel[n, 1], 
-                   'o', color=colors[n], markersize=10, 
-                   markeredgecolor='white', markeredgewidth=2)
+                   marker_style, color=point_color, markersize=marker_size, 
+                   markeredgecolor='white', markeredgewidth=2, alpha=point_alpha)
             
             # Plot trail from beginning to current frame
             if show_trails and t > 0:
                 trail = predicted_points[:t+1, n] * np.array([W, H])
-                ax.plot(trail[:, 0], trail[:, 1], 
-                       '-', color=colors[n], linewidth=2, alpha=0.6)
+                # Only show trail if point is visible in current frame
+                if visibility >= visibility_threshold:
+                    ax.plot(trail[:, 0], trail[:, 1], 
+                           '-', color=colors[n], linewidth=2, alpha=trail_alpha)
             
-            # Label point number on first frame
+            # Label point number on first frame (with visibility score)
             if t == 0:
+                label = str(n+1)
+                if predicted_visibility is not None:
+                    label += f'\n({visibility:.2f})'
                 ax.text(points_pixel[n, 0] + 5, points_pixel[n, 1] - 5,
-                       str(n+1), color='white', fontsize=10, fontweight='bold',
+                       label, color='white', fontsize=9, fontweight='bold',
                        bbox=dict(boxstyle='round,pad=0.3', facecolor=colors[n], alpha=0.7))
         
         title = f'Frame {t}'
@@ -299,7 +323,7 @@ def visualize_tracking_results(frames, predicted_points, query_points, save_path
 
 
 def save_results_json(predicted_points, query_points, frame_names, save_path, 
-                     camera_params=None, rays=None):
+                     camera_params=None, rays=None, visibility=None):
     """Save tracking results to JSON file"""
     results = {
         'num_frames': len(frame_names),
@@ -308,6 +332,9 @@ def save_results_json(predicted_points, query_points, frame_names, save_path,
         'frame_names': frame_names,
         'trajectories': predicted_points.tolist(),  # (T, N, 2)
     }
+    
+    if visibility is not None:
+        results['visibility'] = visibility.tolist()  # (T, N)
     
     if camera_params is not None:
         results['camera_parameters'] = {
@@ -326,20 +353,27 @@ def save_results_json(predicted_points, query_points, frame_names, save_path,
     print(f"Saved results to JSON: {save_path}")
 
 
-def save_results_txt(predicted_points, query_points, frame_names, save_path):
+def save_results_txt(predicted_points, query_points, frame_names, save_path, visibility=None):
     """Save tracking results to simple text file"""
     with open(save_path, 'w') as f:
         f.write(f"# Point Tracking Results\n")
         f.write(f"# Num frames: {len(frame_names)}\n")
         f.write(f"# Num points: {len(query_points)}\n")
         f.write(f"#\n")
-        f.write(f"# Format: frame_idx, point_idx, x, y\n")
+        if visibility is not None:
+            f.write(f"# Format: frame_idx, point_idx, x, y, visibility\n")
+        else:
+            f.write(f"# Format: frame_idx, point_idx, x, y\n")
         f.write(f"#\n")
         
         for t, frame_name in enumerate(frame_names):
             for n in range(len(query_points)):
                 x, y = predicted_points[t, n]
-                f.write(f"{t}, {n}, {x:.6f}, {y:.6f}\n")
+                if visibility is not None:
+                    vis = visibility[t, n]
+                    f.write(f"{t}, {n}, {x:.6f}, {y:.6f}, {vis:.4f}\n")
+                else:
+                    f.write(f"{t}, {n}, {x:.6f}, {y:.6f}\n")
     
     print(f"Saved results to TXT: {save_path}")
 
@@ -367,7 +401,6 @@ def run_inference(args):
         dropout=0.0,  # No dropout for inference
         backbone=args.backbone,
         pretrained=False,
-        use_correlation_matching=args.use_correlation_matching,
         search_radius=args.search_radius
     ).to(device)
     
@@ -441,6 +474,14 @@ def run_inference(args):
     predicted_points = output['points'].squeeze(0).cpu().numpy()  # (T, N, 2)
     print(f"✓ Predicted trajectories: {predicted_points.shape}")
     
+    # Extract visibility predictions
+    predicted_visibility = None
+    if 'visibility' in output:
+        predicted_visibility = output['visibility'].squeeze(0).cpu().numpy()  # (T, N)
+        print(f"✓ Predicted visibility: {predicted_visibility.shape}")
+        avg_visibility = predicted_visibility.mean()
+        print(f"  Average visibility: {avg_visibility:.3f}")
+    
     rays = None
     if args.predict_rays and 'rays' in output:
         rays = output['rays'].squeeze(0).cpu().numpy()  # (T, N, 6)
@@ -465,7 +506,8 @@ def run_inference(args):
     vis_path = output_dir / 'tracking_visualization.png'
     visualize_tracking_results(
         frames, predicted_points, query_points, vis_path,
-        frame_names=frame_names, show_trails=args.show_trails
+        frame_names=frame_names, show_trails=args.show_trails,
+        predicted_visibility=predicted_visibility
     )
     
     # Save results
@@ -473,12 +515,13 @@ def run_inference(args):
     save_results_json(
         predicted_points, query_points, frame_names,
         output_dir / 'results.json',
-        camera_params=camera_params, rays=rays
+        camera_params=camera_params, rays=rays, visibility=predicted_visibility
     )
     
     save_results_txt(
         predicted_points, query_points, frame_names,
-        output_dir / 'results.txt'
+        output_dir / 'results.txt',
+        visibility=predicted_visibility
     )
     
     print(f"\n{'='*60}")
@@ -521,8 +564,8 @@ def main():
                         help='Number of points (used for interactive selection)')
     parser.add_argument('--backbone', type=str, default='resnet18',
                         choices=['resnet18', 'resnet34', 'resnet50'])
-    parser.add_argument('--use_correlation_matching', action='store_true', default=True)
-    parser.add_argument('--search_radius', type=int, default=4)
+    parser.add_argument('--search_radius', type=int, default=4,
+                        help='Search radius for cosine similarity matching')
     
     # Processing options
     parser.add_argument('--image_size', type=int, default=256,
