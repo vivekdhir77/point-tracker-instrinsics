@@ -160,7 +160,9 @@ class PointTracker(nn.Module):
         # Project point features to hidden dimension
         self.point_feat_proj = nn.Linear(feature_dim, hidden_dim)
         
-        # Learnable temporal token (one per frame) to aggregate frame-level information
+        # Learnable temporal token template - one per frame
+        # For long sequences, this grows frame-wise: (T, hidden_dim) where T is number of frames
+        # Each frame gets its own temporal token that accumulates context from all previous frames
         self.temporal_token = nn.Parameter(torch.randn(1, 1, hidden_dim))
         nn.init.normal_(self.temporal_token, mean=0, std=0.02)
         
@@ -711,13 +713,15 @@ class PointTracker(nn.Module):
         translation = -torch.bmm(rotation, camera_center.unsqueeze(-1)).squeeze(-1)
         return translation
     
-    def forward(self, frames, initial_points, return_attention=False, return_rays=False, return_camera=False):
+    def forward(self, frames, initial_points, previous_temporal_tokens=None, return_attention=False, return_rays=False, return_camera=False):
         """
-        Forward pass
+        Forward pass with frame-wise temporal tokens for long context
         
         Args:
             frames: (B, T, C, H, W) video frames
             initial_points: (B, N, 2) initial point locations (normalized [0, 1])
+            previous_temporal_tokens: (B, T_prev, hidden_dim) optional temporal tokens from previous frames
+                                      If None, starts fresh. Each frame gets its own temporal token.
             return_attention: whether to return attention weights
             return_rays: whether to return predicted rays (Plücker coordinates)
             return_camera: whether to recover and return camera parameters (center, rotation, intrinsics, translation)
@@ -725,6 +729,7 @@ class PointTracker(nn.Module):
         Returns:
             dict with keys:
                 'points': (B, T, N, 2) predicted point locations (always present)
+                'temporal_tokens': (B, T_prev + T, hidden_dim) all temporal tokens including new ones (always present)
                 'rays': (B, T, N, 6) predicted rays in Plücker coordinates (if return_rays=True)
                 'camera': dict with camera parameters (if return_camera=True)
                     - 'center': (B, T, 3) camera center in world coordinates
@@ -734,13 +739,31 @@ class PointTracker(nn.Module):
                 'attention': list of attention weights (if return_attention=True)
         
         Example:
-            >>> output = model(frames, initial_points, return_rays=True, return_camera=True)
+            >>> # First window (frames 0-15)
+            >>> output = model(frames, initial_points, return_rays=True)
             >>> predicted_points = output['points']
-            >>> predicted_rays = output['rays']
-            >>> camera_center = output['camera']['center']
+            >>> all_tokens = output['temporal_tokens']  # (B, 16, hidden_dim) - one per frame
+            >>> 
+            >>> # Next window (frames 16-31) - pass all previous tokens
+            >>> output = model(next_frames, next_points, previous_temporal_tokens=all_tokens)
+            >>> # Now all_tokens will be (B, 32, hidden_dim) - grows frame by frame
         """
         B, T, C, H, W = frames.shape
         N = initial_points.shape[1]
+        
+        # Initialize frame-wise temporal tokens
+        # If previous_temporal_tokens is provided (from previous windows), use them
+        # Otherwise, start fresh. Each frame in current window gets its own temporal token.
+        if previous_temporal_tokens is not None:
+            T_prev = previous_temporal_tokens.shape[1]  # Number of previous frames
+            # Create new temporal tokens for current window frames
+            new_temporal_tokens = self.temporal_token.expand(B, T, -1)  # (B, T, hidden_dim)
+            # Concatenate previous + new temporal tokens
+            all_temporal_tokens = torch.cat([previous_temporal_tokens, new_temporal_tokens], dim=1)  # (B, T_prev + T, hidden_dim)
+        else:
+            T_prev = 0
+            # Create temporal tokens for all frames in current window
+            all_temporal_tokens = self.temporal_token.expand(B, T, -1)  # (B, T, hidden_dim)
         
         # Extract frame features for all frames [0, T]
         frame_features = self.feature_extractor(frames)  # (B, T, C_feat, H_feat, W_feat)
@@ -748,6 +771,14 @@ class PointTracker(nn.Module):
         # Track points through frames iteratively with transformer processing
         # At each step, use temporal context and attention from all previous frames
         tracked_points = initial_points.unsqueeze(1)  # (B, 1, N, 2)
+        
+        # Initialize attention weights list for collecting attention if needed
+        attention_weights_list = []
+        
+        # For iterative tracking, we use temporal tokens for frames in current window
+        # all_temporal_tokens: (B, T_prev + T, hidden_dim) - includes previous + current window
+        # For current window frames, use tokens at indices [T_prev, T_prev + T)
+        current_window_temporal_tokens = all_temporal_tokens[:, T_prev:, :]  # (B, T, hidden_dim)
         
         # Track points frame by frame with full transformer processing
         # Store transformer output from last iteration for reuse in refinement
@@ -808,19 +839,8 @@ class PointTracker(nn.Module):
             x_history_frames = x_history.reshape(B, num_tracked_frames, N, self.hidden_dim)
             x_next_frame = x_next.unsqueeze(1)  # (B, 1, N, hidden_dim)
             
-            # Create temporal tokens for all frames together
-            temporal_tokens_all = self.temporal_token.expand(B, num_tracked_frames + 1, -1)  # (B, t+2, hidden_dim)
-            
-            # Add temporal positional encoding to temporal tokens (0 to t+1)
-            temporal_pos_tokens_all = torch.arange(num_tracked_frames + 1, device=frames.device).unsqueeze(0).repeat(B, 1)  # (B, t+2)
-            temporal_embed_tokens_all = self.get_sinusoidal_positional_encoding(
-                temporal_pos_tokens_all, self.hidden_dim
-            )  # (B, t+2, hidden_dim)
-            temporal_tokens_all = temporal_tokens_all + temporal_embed_tokens_all
-            
-            # Split into history and next
-            temporal_tokens_history = temporal_tokens_all[:, :num_tracked_frames]  # (B, t+1, hidden_dim)
-            temporal_token_next = temporal_tokens_all[:, num_tracked_frames:num_tracked_frames+1]  # (B, 1, hidden_dim)
+            # Use persistent temporal token (shared across all frames for long context)
+            # The token is updated through the transformer and carries information forward
             
             # Extract global frame-level features via global max pooling (PointNet-style)
             # frame_feat_history: (B, t+1, C_feat, H_feat, W_feat)
@@ -837,39 +857,83 @@ class PointTracker(nn.Module):
             frame_feat_next_global_proj = self.point_feat_proj(frame_feat_next_global)  # (B, hidden_dim)
             frame_feat_next_global_proj = frame_feat_next_global_proj.unsqueeze(1)  # (B, 1, hidden_dim)
             
-            # Interleave temporal tokens, frame features, and point tokens
-            # For each frame: [temporal_token, frame_feature, point1, point2, ..., pointN]
-            x_history_with_tokens = []
+            # Build sequence with frame-wise temporal tokens
+            # Get temporal tokens for history frames and next frame from current window
+            # current_window_temporal_tokens: (B, T, hidden_dim) - tokens for current window frames
+            history_temporal_tokens = current_window_temporal_tokens[:, :num_tracked_frames, :]  # (B, t+1, hidden_dim)
+            next_temporal_token = current_window_temporal_tokens[:, num_tracked_frames:num_tracked_frames+1, :]  # (B, 1, hidden_dim)
+            
+            # Structure: [prev_temp_tokens..., temp_0, frame0_feature, frame0_pt0, ..., 
+            #             temp_1, frame1_feature, frame1_pt0, ..., 
+            #             temp_next, frame_next_feature, frame_next_pt0, ...]
+            x_with_tokens = []
+            
+            # Add previous temporal tokens if they exist
+            if T_prev > 0:
+                prev_temporal_tokens = all_temporal_tokens[:, :T_prev, :]  # (B, T_prev, hidden_dim)
+                x_with_tokens.append(prev_temporal_tokens)
+            
+            # Add history frames: for each frame, [temporal_token, frame_feature, point_tokens]
             for i in range(num_tracked_frames):
-                x_history_with_tokens.append(temporal_tokens_history[:, i:i+1, :])  # Temporal token
-                x_history_with_tokens.append(frame_feat_global_proj[:, i:i+1, :])  # Frame feature
-                x_history_with_tokens.append(x_history_frames[:, i, :, :])  # N point tokens
-            x_history_seq = torch.cat(x_history_with_tokens, dim=1)  # (B, (t+1)*(N+2), hidden_dim)
+                x_with_tokens.append(history_temporal_tokens[:, i:i+1, :])  # Frame's temporal token
+                x_with_tokens.append(frame_feat_global_proj[:, i:i+1, :])  # Frame feature
+                x_with_tokens.append(x_history_frames[:, i, :, :])  # N point tokens
             
-            x_next_with_token = torch.cat([
-                temporal_token_next, 
-                frame_feat_next_global_proj, 
-                x_next_frame.squeeze(1)
-            ], dim=1)  # (B, N+2, hidden_dim)
+            # Add next frame
+            x_with_tokens.append(next_temporal_token)  # Next frame's temporal token
+            x_with_tokens.append(frame_feat_next_global_proj)  # Next frame feature
+            x_with_tokens.append(x_next_frame.squeeze(1))  # Next frame point tokens
             
-            # Concatenate history and next frame features
-            x = torch.cat([x_history_seq, x_next_with_token], dim=1)  # (B, (t+2)*(N+2), hidden_dim)
+            # Concatenate all features
+            x = torch.cat(x_with_tokens, dim=1)  # (B, T_prev + (t+2)*(N+2), hidden_dim)
             
             # Process through transformer layers with attention
             for layer in self.transformer_layers:
-                x, _ = layer(x)
+                x, attn_weights = layer(x)
+                if return_attention:
+                    attention_weights_list.append(attn_weights)
             
             # Extract features for the last frame's points (from history) and next frame's points
-            # History sequence structure: [temp0, frame0, pts0, temp1, frame1, pts1, ..., temp_t, frame_t, pts_t]
-            # Next frame structure: [temp_next, frame_next, pts_next]
+            # Sequence structure: [prev_tokens..., temp_0, frame0, pts0, temp_1, frame1, pts1, ..., temp_t, frame_t, pts_t, temp_next, frame_next, pts_next]
             # Extract last frame's point features from transformer output
             last_frame_idx = num_tracked_frames - 1
-            last_frame_start = last_frame_idx * (N + 2) + 2  # Skip temporal token and frame feature
+            last_frame_start = T_prev + last_frame_idx * (N + 2) + 2  # Skip previous tokens, temporal token, and frame feature
             last_frame_end = last_frame_start + N
             x_last_frame_points = x[:, last_frame_start:last_frame_end, :]  # (B, N, hidden_dim)
             
             # Extract next frame's point features (last N tokens)
             x_next_out = x[:, -N:, :]  # (B, N, hidden_dim) - last N tokens are the point tokens
+            
+            # Update temporal tokens - extract updated tokens from transformer output
+            # Update the current window's temporal tokens that were used
+            # Extract updated tokens: previous (if any) + updated history + updated next
+            if T_prev > 0:
+                # Previous tokens are at the beginning
+                updated_prev_tokens = x[:, :T_prev, :]  # (B, T_prev, hidden_dim)
+                # Updated current window tokens start after previous tokens
+                updated_current_start = T_prev
+            else:
+                updated_prev_tokens = None
+                updated_current_start = 0
+            
+            # Extract updated tokens for frames used in this iteration (history + next)
+            updated_history_tokens = x[:, updated_current_start:updated_current_start+num_tracked_frames, :]  # (B, t+1, hidden_dim)
+            updated_next_token = x[:, updated_current_start+num_tracked_frames:updated_current_start+num_tracked_frames+1, :]  # (B, 1, hidden_dim)
+            
+            # Update current_window_temporal_tokens with the updated values
+            # Keep tokens for frames not yet processed unchanged
+            updated_current_window_tokens = current_window_temporal_tokens.clone()
+            updated_current_window_tokens[:, :num_tracked_frames, :] = updated_history_tokens
+            updated_current_window_tokens[:, num_tracked_frames:num_tracked_frames+1, :] = updated_next_token
+            
+            # Reconstruct all_temporal_tokens
+            if T_prev > 0:
+                all_temporal_tokens = torch.cat([updated_prev_tokens, updated_current_window_tokens], dim=1)  # (B, T_prev + T, hidden_dim)
+            else:
+                all_temporal_tokens = updated_current_window_tokens  # (B, T, hidden_dim)
+            
+            # Update current_window_temporal_tokens for next iteration
+            current_window_temporal_tokens = updated_current_window_tokens
             
             # Use cosine similarity to find best matches in next frame
             # Get feature map dimensions
@@ -929,15 +993,10 @@ class PointTracker(nn.Module):
         # Reshape to separate frames
         x_all_frames = x_all.reshape(B, T, N, self.hidden_dim)  # (B, T, N, hidden_dim)
         
-        # Create temporal tokens for all frames
-        temporal_tokens_all = self.temporal_token.expand(B, T, -1)  # (B, T, hidden_dim)
-        
-        # Add temporal positional encoding to temporal tokens
-        temporal_pos_tokens_all = torch.arange(T, device=frames.device).unsqueeze(0).repeat(B, 1)  # (B, T)
-        temporal_embed_tokens_all = self.get_sinusoidal_positional_encoding(
-            temporal_pos_tokens_all, self.hidden_dim
-        )  # (B, T, hidden_dim)
-        temporal_tokens_all = temporal_tokens_all + temporal_embed_tokens_all
+        # Use frame-wise temporal tokens - one per frame
+        # all_temporal_tokens: (B, T_prev + T, hidden_dim) - includes previous frames + current window
+        # For current window, we use tokens at indices [T_prev, T_prev + T)
+        current_temporal_tokens = all_temporal_tokens[:, T_prev:, :]  # (B, T, hidden_dim)
         
         # Extract global frame-level features via global max pooling (PointNet-style)
         # frame_features: (B, T, C_feat, H_feat, W_feat)
@@ -949,24 +1008,55 @@ class PointTracker(nn.Module):
         # Project to hidden dimension
         frame_feat_global_all_proj = self.point_feat_proj(frame_feat_global_all)  # (B, T, hidden_dim)
         
-        # Interleave temporal tokens, frame features, and point tokens
-        # For each frame: [temporal_token, frame_feature, point1, point2, ..., pointN]
+        # Build sequence with frame-wise temporal tokens
+        # Structure: [prev_temp_token_0, ..., prev_temp_token_T_prev-1,  # Previous frames' tokens (if any)
+        #             temp_token_0, frame0_feature, frame0_pt0, ..., frame0_ptN-1,
+        #             temp_token_1, frame1_feature, frame1_pt0, ..., frame1_ptN-1, ...]
+        # Each temporal token can attend to all previous tokens and current frames, maintaining long context
         x_with_tokens = []
+        
+        # Add previous temporal tokens if they exist (for long context)
+        if T_prev > 0:
+            prev_temporal_tokens = all_temporal_tokens[:, :T_prev, :]  # (B, T_prev, hidden_dim)
+            x_with_tokens.append(prev_temporal_tokens)  # Add all previous tokens
+        
+        # Add current window: for each frame, [temporal_token, frame_feature, point_tokens]
         for i in range(T):
-            x_with_tokens.append(temporal_tokens_all[:, i:i+1, :])  # Temporal token
+            x_with_tokens.append(current_temporal_tokens[:, i:i+1, :])  # Frame's temporal token
             x_with_tokens.append(frame_feat_global_all_proj[:, i:i+1, :])  # Frame feature
             x_with_tokens.append(x_all_frames[:, i, :, :])  # N point tokens
-        x = torch.cat(x_with_tokens, dim=1)  # (B, T*(N+2), hidden_dim)
+        
+        x = torch.cat(x_with_tokens, dim=1)  # (B, T_prev + T*(N+2), hidden_dim)
         
         # Refinement pass through transformer
         for layer in self.transformer_layers:
-            x, _ = layer(x)
+            x, attn_weights = layer(x)
+            if return_attention:
+                attention_weights_list.append(attn_weights)
         
-        # Extract only point tokens (skip temporal tokens and frame features) and reshape
-        # Sequence is: [temp0, frame0, pt0_0, ..., pt0_N-1, temp1, frame1, pt1_0, ..., pt1_N-1, ...]
+        # Extract updated temporal tokens for current window frames
+        # Sequence structure: [prev_temp_0, ..., prev_temp_T_prev-1, 
+        #                      temp_0, frame0, pts0, temp_1, frame1, pts1, ...]
+        # Extract current window's temporal tokens (after T_prev previous tokens)
+        updated_current_temporal_tokens = []
+        for i in range(T):
+            token_idx = T_prev + i * (N + 2)  # Position of temporal token for frame i
+            updated_current_temporal_tokens.append(x[:, token_idx:token_idx+1, :])  # (B, 1, hidden_dim)
+        updated_current_temporal_tokens = torch.cat(updated_current_temporal_tokens, dim=1)  # (B, T, hidden_dim)
+        
+        # Combine previous + updated current temporal tokens
+        if T_prev > 0:
+            # Extract previous temporal tokens (they may have been updated too)
+            updated_prev_temporal_tokens = x[:, :T_prev, :]  # (B, T_prev, hidden_dim)
+            all_updated_temporal_tokens = torch.cat([updated_prev_temporal_tokens, updated_current_temporal_tokens], dim=1)  # (B, T_prev + T, hidden_dim)
+        else:
+            all_updated_temporal_tokens = updated_current_temporal_tokens  # (B, T, hidden_dim)
+        
+        # Extract point tokens (skip temporal tokens and frame features) and reshape
+        # Sequence is: [prev_tokens..., temp_0, frame0, pt0_0, ..., pt0_N-1, temp_1, frame1, pt1_0, ..., pt1_N-1, ...]
         x_points_only = []
         for i in range(T):
-            start_idx = i * (N + 2) + 2  # Skip temporal token (pos 0) and frame feature (pos 1)
+            start_idx = T_prev + i * (N + 2) + 2  # Skip previous tokens, temporal token, and frame feature
             end_idx = start_idx + N
             x_points_only.append(x[:, start_idx:end_idx, :])  # (B, N, hidden_dim)
         x_points = torch.stack(x_points_only, dim=1)  # (B, T, N, hidden_dim)
@@ -989,10 +1079,10 @@ class PointTracker(nn.Module):
         
         if return_rays or return_camera:
             # Extract frame features from transformer output
-            # Sequence structure: [temp0, frame0, pts0, temp1, frame1, pts1, ...]
+            # Sequence structure: [prev_tokens..., temp_0, frame0, pts0, temp_1, frame1, pts1, ...]
             x_frame_features = []
             for i in range(T):
-                frame_idx = i * (N + 2) + 1  # Frame feature position (skip temporal token)
+                frame_idx = T_prev + i * (N + 2) + 1  # Frame feature position (skip previous tokens, temporal token)
                 x_frame_features.append(x[:, frame_idx:frame_idx+1, :])  # (B, 1, hidden_dim)
             x_frame_features = torch.stack(x_frame_features, dim=1)  # (B, T, 1, hidden_dim)
             
@@ -1065,6 +1155,7 @@ class PointTracker(nn.Module):
         results = {
             'points': predicted_points,  # Always returned: (B, T, N, 2)
             'visibility': visibility_all,  # Always returned: (B, T, N) - visibility probability
+            'temporal_tokens': all_updated_temporal_tokens,  # Always returned: (B, T_prev + T, hidden_dim) - grows frame by frame
         }
         
         if return_rays:

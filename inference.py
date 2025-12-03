@@ -378,6 +378,109 @@ def save_results_txt(predicted_points, query_points, frame_names, save_path, vis
     print(f"Saved results to TXT: {save_path}")
 
 
+def run_sliding_window_inference(model, frames_tensor, initial_points, window_size, 
+                                  return_rays=False, return_camera=False):
+    """
+    Run inference with sliding window, propagating frame-wise temporal tokens across windows
+    
+    Args:
+        model: PointTracker model
+        frames_tensor: (1, T, C, H, W) all frames
+        initial_points: (1, N, 2) initial point locations
+        window_size: size of each window
+        return_rays: whether to return rays
+        return_camera: whether to return camera parameters
+    
+    Returns:
+        predicted_points: (T, N, 2) all predicted points
+        predicted_visibility: (T, N) visibility predictions
+        rays: (T, N, 6) rays if return_rays=True, else None
+        camera_params: dict if return_camera=True, else None
+    """
+    B, T, C, H, W = frames_tensor.shape
+    N = initial_points.shape[1]
+    device = frames_tensor.device
+    
+    # Initialize storage for results
+    all_predicted_points = []
+    all_predicted_visibility = []
+    all_rays = [] if return_rays else None
+    all_camera_params = {'center': [], 'rotation': [], 'intrinsics': [], 'translation': []} if return_camera else None
+    
+    # Initialize frame-wise temporal tokens (None for first window - starts fresh)
+    # These will grow frame by frame: (1, T_processed, hidden_dim)
+    previous_temporal_tokens = None
+    current_points = initial_points  # (1, N, 2)
+    
+    # Process windows
+    num_windows = (T + window_size - 1) // window_size  # Ceiling division
+    
+    for w in range(num_windows):
+        start_idx = w * window_size
+        end_idx = min(start_idx + window_size, T)
+        window_frames = frames_tensor[:, start_idx:end_idx, :, :, :]  # (1, window_T, C, H, W)
+        window_T = window_frames.shape[1]
+        
+        print(f"  Processing window {w+1}/{num_windows} (frames {start_idx}-{end_idx-1})...")
+        
+        with torch.no_grad():
+            output = model(
+                window_frames,
+                current_points,  # Use points from previous window (or initial for first window)
+                previous_temporal_tokens=previous_temporal_tokens,  # Propagate frame-wise temporal tokens
+                return_rays=return_rays,
+                return_camera=return_camera,
+                return_attention=False
+            )
+        
+        # Extract results for this window
+        window_points = output['points'].squeeze(0).cpu().numpy()  # (window_T, N, 2)
+        window_visibility = output['visibility'].squeeze(0).cpu().numpy()  # (window_T, N)
+        
+        all_predicted_points.append(window_points)
+        all_predicted_visibility.append(window_visibility)
+        
+        if return_rays and 'rays' in output:
+            window_rays = output['rays'].squeeze(0).cpu().numpy()  # (window_T, N, 6)
+            all_rays.append(window_rays)
+        
+        if return_camera and 'camera' in output:
+            cam = output['camera']
+            all_camera_params['center'].append(cam['center'].squeeze(0).cpu().numpy())
+            all_camera_params['rotation'].append(cam['rotation'].squeeze(0).cpu().numpy())
+            all_camera_params['intrinsics'].append(cam['intrinsics'].squeeze(0).cpu().numpy())
+            all_camera_params['translation'].append(cam['translation'].squeeze(0).cpu().numpy())
+        
+        # Update frame-wise temporal tokens for next window
+        # temporal_tokens: (1, T_prev + window_T, hidden_dim) - grows frame by frame
+        previous_temporal_tokens = output['temporal_tokens']  # (1, T_prev + window_T, hidden_dim)
+        
+        # Update current points: use last frame's predictions from this window for next window
+        # This ensures continuity across windows
+        if end_idx < T:  # Not the last window
+            last_frame_points = output['points'][:, -1:, :, :]  # (1, 1, N, 2)
+            current_points = last_frame_points.squeeze(1)  # (1, N, 2)
+    
+    # Concatenate all results
+    predicted_points = np.concatenate(all_predicted_points, axis=0)  # (T, N, 2)
+    predicted_visibility = np.concatenate(all_predicted_visibility, axis=0)  # (T, N)
+    
+    rays = None
+    if return_rays and all_rays:
+        rays = np.concatenate(all_rays, axis=0)  # (T, N, 6)
+    
+    camera_params = None
+    if return_camera and all_camera_params:
+        camera_params = {
+            'center': np.concatenate(all_camera_params['center'], axis=0),  # (T, 3)
+            'rotation': np.concatenate(all_camera_params['rotation'], axis=0),  # (T, 3, 3)
+            'intrinsics': np.concatenate(all_camera_params['intrinsics'], axis=0),  # (T, 3, 3)
+            'translation': np.concatenate(all_camera_params['translation'], axis=0)  # (T, 3)
+        }
+    
+    return predicted_points, predicted_visibility, rays, camera_params
+
+
 def run_inference(args):
     """Main inference function"""
     print("\n" + "="*60)
@@ -459,43 +562,66 @@ def run_inference(args):
     frames_tensor = torch.from_numpy(frames).unsqueeze(0).float().to(device)  # (1, T, C, H, W)
     query_points_tensor = torch.from_numpy(query_points).unsqueeze(0).float().to(device)  # (1, N, 2)
     
-    # Run inference
-    print(f"\nRunning inference on {T} frames...")
-    with torch.no_grad():
-        output = model(
-            frames_tensor,
-            query_points_tensor,
-            return_rays=args.predict_rays,
-            return_camera=args.predict_camera,
-            return_attention=False
-        )
+    # Run inference with sliding window if needed
+    window_size = args.window_size
+    use_sliding_window = args.use_sliding_window and T > window_size
     
-    # Extract results
-    predicted_points = output['points'].squeeze(0).cpu().numpy()  # (T, N, 2)
-    print(f"✓ Predicted trajectories: {predicted_points.shape}")
-    
-    # Extract visibility predictions
+    # Initialize output variables
     predicted_visibility = None
-    if 'visibility' in output:
-        predicted_visibility = output['visibility'].squeeze(0).cpu().numpy()  # (T, N)
-        print(f"✓ Predicted visibility: {predicted_visibility.shape}")
-        avg_visibility = predicted_visibility.mean()
-        print(f"  Average visibility: {avg_visibility:.3f}")
-    
     rays = None
-    if args.predict_rays and 'rays' in output:
-        rays = output['rays'].squeeze(0).cpu().numpy()  # (T, N, 6)
-        print(f"✓ Predicted rays: {rays.shape}")
-    
     camera_params = None
-    if args.predict_camera and 'camera' in output:
-        camera_params = {
-            'center': output['camera']['center'].squeeze(0).cpu().numpy(),  # (T, 3)
-            'rotation': output['camera']['rotation'].squeeze(0).cpu().numpy(),  # (T, 3, 3)
-            'intrinsics': output['camera']['intrinsics'].squeeze(0).cpu().numpy(),  # (T, 3, 3)
-            'translation': output['camera']['translation'].squeeze(0).cpu().numpy()  # (T, 3)
-        }
-        print(f"✓ Recovered camera parameters")
+    output = None
+    
+    if use_sliding_window:
+        print(f"\nRunning sliding window inference on {T} frames (window size: {window_size})...")
+        predicted_points, predicted_visibility, rays, camera_params = run_sliding_window_inference(
+            model, frames_tensor, query_points_tensor, window_size,
+            return_rays=args.predict_rays, return_camera=args.predict_camera
+        )
+        print(f"✓ Predicted trajectories: {predicted_points.shape}")
+        if predicted_visibility is not None:
+            print(f"✓ Predicted visibility: {predicted_visibility.shape}")
+            avg_visibility = predicted_visibility.mean()
+            print(f"  Average visibility: {avg_visibility:.3f}")
+        if rays is not None:
+            print(f"✓ Predicted rays: {rays.shape}")
+        if camera_params is not None:
+            print(f"✓ Recovered camera parameters")
+    else:
+        # Run inference on all frames at once
+        print(f"\nRunning inference on {T} frames...")
+        with torch.no_grad():
+            output = model(
+                frames_tensor,
+                query_points_tensor,
+                previous_temporal_tokens=None,  # First window, no previous tokens
+                return_rays=args.predict_rays,
+                return_camera=args.predict_camera,
+                return_attention=False
+            )
+        
+        # Extract results
+        predicted_points = output['points'].squeeze(0).cpu().numpy()  # (T, N, 2)
+        print(f"✓ Predicted trajectories: {predicted_points.shape}")
+        
+        if 'visibility' in output:
+            predicted_visibility = output['visibility'].squeeze(0).cpu().numpy()  # (T, N)
+            print(f"✓ Predicted visibility: {predicted_visibility.shape}")
+            avg_visibility = predicted_visibility.mean()
+            print(f"  Average visibility: {avg_visibility:.3f}")
+        
+        if args.predict_rays and 'rays' in output:
+            rays = output['rays'].squeeze(0).cpu().numpy()  # (T, N, 6)
+            print(f"✓ Predicted rays: {rays.shape}")
+        
+        if args.predict_camera and 'camera' in output:
+            camera_params = {
+                'center': output['camera']['center'].squeeze(0).cpu().numpy(),  # (T, 3)
+                'rotation': output['camera']['rotation'].squeeze(0).cpu().numpy(),  # (T, 3, 3)
+                'intrinsics': output['camera']['intrinsics'].squeeze(0).cpu().numpy(),  # (T, 3, 3)
+                'translation': output['camera']['translation'].squeeze(0).cpu().numpy()  # (T, 3)
+            }
+            print(f"✓ Recovered camera parameters")
     
     # Create output directory
     output_dir = Path(args.output_dir)
@@ -578,6 +704,12 @@ def main():
                         help='Recover camera parameters')
     parser.add_argument('--show_trails', action='store_true', default=True,
                         help='Show point trails in visualization')
+    
+    # Sliding window options for long sequences
+    parser.add_argument('--use_sliding_window', action='store_true',
+                        help='Use sliding window inference for long sequences')
+    parser.add_argument('--window_size', type=int, default=16,
+                        help='Window size for sliding window inference (default: 16, should match training sequence length)')
     
     args = parser.parse_args()
     
