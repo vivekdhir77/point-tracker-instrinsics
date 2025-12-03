@@ -697,17 +697,30 @@ class PointTracker(nn.Module):
     def forward(self, frames, initial_points, return_attention=False, return_rays=False, return_camera=False):
         """
         Forward pass
+        
         Args:
             frames: (B, T, C, H, W) video frames
             initial_points: (B, N, 2) initial point locations (normalized [0, 1])
             return_attention: whether to return attention weights
             return_rays: whether to return predicted rays (Plücker coordinates)
             return_camera: whether to recover and return camera parameters (center, rotation, intrinsics, translation)
+        
         Returns:
-            predicted_points: (B, T, N, 2) predicted point locations
-            predicted_rays: (B, T, N, 6) predicted rays in Plücker coordinates (if return_rays=True)
-            camera_params: dict with 'center', 'rotation', 'intrinsics', 'translation' (if return_camera=True)
-            attention_weights: list of attention weights (if return_attention=True)
+            dict with keys:
+                'points': (B, T, N, 2) predicted point locations (always present)
+                'rays': (B, T, N, 6) predicted rays in Plücker coordinates (if return_rays=True)
+                'camera': dict with camera parameters (if return_camera=True)
+                    - 'center': (B, T, 3) camera center in world coordinates
+                    - 'rotation': (B, T, 3, 3) rotation matrix R
+                    - 'intrinsics': (B, T, 3, 3) intrinsic matrix K
+                    - 'translation': (B, T, 3) translation vector t
+                'attention': list of attention weights (if return_attention=True)
+        
+        Example:
+            >>> output = model(frames, initial_points, return_rays=True, return_camera=True)
+            >>> predicted_points = output['points']
+            >>> predicted_rays = output['rays']
+            >>> camera_center = output['camera']['center']
         """
         B, T, C, H, W = frames.shape
         N = initial_points.shape[1]
@@ -986,15 +999,18 @@ class PointTracker(nn.Module):
                 'translation': torch.stack(camera_translations, dim=1)  # (B, T, 3)
             }
         
-        # Return results based on flags
-        results = [predicted_points]
-        if return_rays:
-            results.append(predicted_rays)
-        if return_camera:
-            results.append(camera_params)
-        if return_attention:
-            results.append(attention_weights_list)
+        # Return results as dictionary for cleaner API
+        results = {
+            'points': predicted_points,  # Always returned: (B, T, N, 2)
+        }
         
-        if len(results) == 1:
-            return results[0]
-        return tuple(results)
+        if return_rays:
+            results['rays'] = predicted_rays  # (B, T, N, 6)
+        
+        if return_camera:
+            results['camera'] = camera_params  # dict with center, rotation, intrinsics, translation
+        
+        if return_attention:
+            results['attention'] = attention_weights_list  # list of attention weights
+        
+        return results

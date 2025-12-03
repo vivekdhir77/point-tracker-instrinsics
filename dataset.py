@@ -34,12 +34,14 @@ class PointOdysseyDataset(Dataset):
         num_points=8,
         image_size=(256, 256),
         min_frames=20,
+        max_frames_per_video=None,
     ):
         self.data_root = Path(data_root)
         self.sequence_length = sequence_length
         self.num_points = num_points
         self.image_size = image_size
         self.min_frames = min_frames
+        self.max_frames_per_video = max_frames_per_video
         
         if video_dirs is None:
             self.video_dirs = [d.name for d in self.data_root.iterdir() if d.is_dir()]
@@ -60,9 +62,26 @@ class PointOdysseyDataset(Dataset):
                 with np.load(anno_path) as anno:
                     trajs_2d = anno['trajs_2d'].copy()  # (T, N, 2)
                     visibs = anno['visibs'].copy()  # (T, N)
+                    
+                    # Load 3D data and camera parameters if available
+                    trajs_3d = anno.get('trajs_3d', None)
+                    if trajs_3d is not None:
+                        trajs_3d = trajs_3d.copy()  # (T, N, 3)
+                    
+                    intrinsics = anno.get('intrinsics', None)
+                    if intrinsics is not None:
+                        intrinsics = intrinsics.copy()  # (T, 3, 3) or (3, 3)
+                    
+                    extrinsics = anno.get('extrinsics', None)
+                    if extrinsics is not None:
+                        extrinsics = extrinsics.copy()  # (T, 4, 4) or (4, 4)
+                
                 self.video_annotations[video_dir_name] = {
                     'trajs_2d': trajs_2d,
-                    'visibs': visibs
+                    'visibs': visibs,
+                    'trajs_3d': trajs_3d,
+                    'intrinsics': intrinsics,
+                    'extrinsics': extrinsics
                 }
             except Exception as e:
                 print(f"Warning: Could not load {anno_path}: {e}")
@@ -75,6 +94,11 @@ class PointOdysseyDataset(Dataset):
             frames_in_dir = len(frame_files)
             frames_in_anno = trajs_2d.shape[0]
             num_frames = min(frames_in_dir, frames_in_anno)
+            
+            # Apply max_frames_per_video constraint if specified
+            if self.max_frames_per_video is not None:
+                num_frames = min(num_frames, self.max_frames_per_video)
+                print(f"Info: Limiting {video_dir_name} to {num_frames} frames (max_frames_per_video={self.max_frames_per_video})")
             
             if num_frames < self.min_frames:
                 print(f"Warning: Skipping {video_dir_name} - only {num_frames} frames available (minimum: {self.min_frames})")
@@ -134,6 +158,9 @@ class PointOdysseyDataset(Dataset):
         anno_data = self.video_annotations[video_dir_name]
         trajs_2d = anno_data['trajs_2d']
         visibs = anno_data['visibs']
+        trajs_3d = anno_data.get('trajs_3d', None)
+        intrinsics = anno_data.get('intrinsics', None)
+        extrinsics = anno_data.get('extrinsics', None)
         
         frame_indices = list(range(start_idx, start_idx + self.sequence_length))
         
@@ -148,9 +175,15 @@ class PointOdysseyDataset(Dataset):
         
         # trajs_2d: (T_anno, N_total, 2)
         # visibs: (T_anno, N_total)
+        # trajs_3d: (T_anno, N_total, 3) if available
         gt_trajectories = []
         gt_visibilities = []
+        gt_trajectories_3d = []
         initial_points = None
+        
+        # Collect intrinsics and extrinsics for selected frames
+        gt_intrinsics = []
+        gt_extrinsics = []
         
         for t, frame_idx in enumerate(frame_indices):
             if frame_idx >= trajs_2d.shape[0]:
@@ -169,17 +202,42 @@ class PointOdysseyDataset(Dataset):
             
             gt_trajectories.append(normalized_coords)
             gt_visibilities.append(frame_visibs)
+            
+            # Collect 3D trajectories if available
+            if trajs_3d is not None:
+                frame_3d = trajs_3d[frame_idx, selected_indices, :]  # (N, 3)
+                gt_trajectories_3d.append(frame_3d)
+            
+            # Collect intrinsics
+            if intrinsics is not None:
+                if len(intrinsics.shape) == 3:
+                    # Intrinsics vary per frame: (T, 3, 3)
+                    gt_intrinsics.append(intrinsics[frame_idx])
+                else:
+                    # Constant intrinsics: (3, 3)
+                    gt_intrinsics.append(intrinsics)
+            
+            # Collect extrinsics
+            if extrinsics is not None:
+                if len(extrinsics.shape) == 3:
+                    # Extrinsics vary per frame: (T, 4, 4)
+                    gt_extrinsics.append(extrinsics[frame_idx])
+                else:
+                    # Constant extrinsics: (4, 4)
+                    gt_extrinsics.append(extrinsics)
         
         gt_trajectories = np.array(gt_trajectories, dtype=np.float32)  # (T, N, 2)
         gt_visibilities = np.array(gt_visibilities, dtype=np.float32)  # (T, N)
         initial_points = np.array(initial_points, dtype=np.float32)  # (N, 2)
         
+        # Convert to torch tensors
         frames = torch.from_numpy(frames).float()
         initial_points = torch.from_numpy(initial_points).float()
         gt_trajectories = torch.from_numpy(gt_trajectories).float()
         gt_visibilities = torch.from_numpy(gt_visibilities).float()
         
-        return {
+        # Prepare return dictionary
+        result = {
             'frames': frames,  # (T, C, H, W)
             'initial_points': initial_points,  # (N, 2)
             'gt_trajectories': gt_trajectories,  # (T, N, 2)
@@ -187,3 +245,18 @@ class PointOdysseyDataset(Dataset):
             'video_name': video_dir_name,
             'start_idx': start_idx
         }
+        
+        # Add 3D data if available
+        if len(gt_trajectories_3d) > 0:
+            gt_trajectories_3d = np.array(gt_trajectories_3d, dtype=np.float32)  # (T, N, 3)
+            result['gt_trajectories_3d'] = torch.from_numpy(gt_trajectories_3d).float()
+        
+        if len(gt_intrinsics) > 0:
+            gt_intrinsics = np.array(gt_intrinsics, dtype=np.float32)  # (T, 3, 3)
+            result['gt_intrinsics'] = torch.from_numpy(gt_intrinsics).float()
+        
+        if len(gt_extrinsics) > 0:
+            gt_extrinsics = np.array(gt_extrinsics, dtype=np.float32)  # (T, 4, 4)
+            result['gt_extrinsics'] = torch.from_numpy(gt_extrinsics).float()
+        
+        return result
