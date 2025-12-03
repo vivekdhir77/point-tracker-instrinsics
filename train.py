@@ -16,13 +16,16 @@ from dataset import PointOdysseyDataset
 from visualize import visualize_attention, plot_loss_history, visualize_predictions
 
 
-def compute_loss(pred_points, gt_points, initial_points):
+def compute_loss(pred_points, gt_points, initial_points, pred_depth=None, gt_depth=None, depth_weight=0.5):
     """
-    Compute tracking loss
+    Compute tracking loss (and optionally depth loss)
     Args:
         pred_points: (B, T, N, 2) predicted points
         gt_points: (B, T, N, 2) ground truth points
         initial_points: (B, N, 2) initial points
+        pred_depth: (B, T, N, 1) predicted depth (optional)
+        gt_depth: (B, T, N, 1) ground truth depth (optional)
+        depth_weight: weight for depth loss in total loss
     """
     l1_loss = nn.functional.l1_loss(pred_points, gt_points)
     
@@ -36,13 +39,19 @@ def compute_loss(pred_points, gt_points, initial_points):
     else:
         temporal_loss = torch.tensor(0.0, device=pred_points.device)
     
-    total_loss = l1_loss + 0.1 * temporal_loss
+    # Compute depth loss if depth predictions and ground truth are provided
+    depth_loss = torch.tensor(0.0, device=pred_points.device)
+    if pred_depth is not None and gt_depth is not None:
+        depth_loss = nn.functional.l1_loss(pred_depth, gt_depth)
+    
+    total_loss = l1_loss + 0.1 * temporal_loss + depth_weight * depth_loss
     
     return {
         'total_loss': total_loss,
         'l1_loss': l1_loss,
         'epe': epe_loss,
-        'temporal_loss': temporal_loss
+        'temporal_loss': temporal_loss,
+        'depth_loss': depth_loss
     }
 
 
@@ -53,10 +62,10 @@ def accumulate_losses(total_losses, losses, num_batches):
     return num_batches + 1
 
 
-def train_epoch(model, dataloader, optimizer, device, epoch, writer, save_dir):
+def train_epoch(model, dataloader, optimizer, device, epoch, writer, save_dir, use_depth=False):
     """Train for one epoch"""
     model.train()
-    total_losses = {'total_loss': 0, 'l1_loss': 0, 'epe': 0, 'temporal_loss': 0}
+    total_losses = {'total_loss': 0, 'l1_loss': 0, 'epe': 0, 'temporal_loss': 0, 'depth_loss': 0}
     num_batches = 0
     
     pbar = tqdm(dataloader, desc=f'Epoch {epoch}')
@@ -67,11 +76,22 @@ def train_epoch(model, dataloader, optimizer, device, epoch, writer, save_dir):
         
         optimizer.zero_grad()
         
-        pred_points, attention_weights = model(
-            frames, initial_points, return_attention=True
-        )
+        # Forward pass with optional depth prediction
+        if use_depth:
+            pred_points, pred_depth, attention_weights = model(
+                frames, initial_points, return_attention=True, return_depth=True
+            )
+            gt_depth = batch.get('gt_depth', None)
+            if gt_depth is not None:
+                gt_depth = gt_depth.to(device)  # (B, T, N, 1)
+        else:
+            pred_points, attention_weights = model(
+                frames, initial_points, return_attention=True, return_depth=False
+            )
+            pred_depth = None
+            gt_depth = None
         
-        losses = compute_loss(pred_points, gt_trajectories, initial_points)
+        losses = compute_loss(pred_points, gt_trajectories, initial_points, pred_depth, gt_depth)
         
         losses['total_loss'].backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -79,10 +99,13 @@ def train_epoch(model, dataloader, optimizer, device, epoch, writer, save_dir):
         
         num_batches = accumulate_losses(total_losses, losses, num_batches)
         
-        pbar.set_postfix({
+        postfix = {
             'loss': f"{losses['total_loss'].item():.4f}",
             'epe': f"{losses['epe'].item():.4f}"
-        })
+        }
+        if use_depth:
+            postfix['depth'] = f"{losses['depth_loss'].item():.4f}"
+        pbar.set_postfix(postfix)
         
         global_step = epoch * len(dataloader) + batch_idx
         for key, value in losses.items():
@@ -107,10 +130,10 @@ def train_epoch(model, dataloader, optimizer, device, epoch, writer, save_dir):
     return avg_losses
 
 
-def validate(model, dataloader, device, epoch, writer, save_dir):
+def validate(model, dataloader, device, epoch, writer, save_dir, use_depth=False):
     """Validate the model"""
     model.eval()
-    total_losses = {'total_loss': 0, 'l1_loss': 0, 'epe': 0, 'temporal_loss': 0}
+    total_losses = {'total_loss': 0, 'l1_loss': 0, 'epe': 0, 'temporal_loss': 0, 'depth_loss': 0}
     num_batches = 0
     
     with torch.no_grad():
@@ -119,11 +142,22 @@ def validate(model, dataloader, device, epoch, writer, save_dir):
             initial_points = batch['initial_points'].to(device)
             gt_trajectories = batch['gt_trajectories'].to(device)
             
-            pred_points, attention_weights = model(
-                frames, initial_points, return_attention=True
-            )
+            # Forward pass with optional depth prediction
+            if use_depth:
+                pred_points, pred_depth, attention_weights = model(
+                    frames, initial_points, return_attention=True, return_depth=True
+                )
+                gt_depth = batch.get('gt_depth', None)
+                if gt_depth is not None:
+                    gt_depth = gt_depth.to(device)
+            else:
+                pred_points, attention_weights = model(
+                    frames, initial_points, return_attention=True, return_depth=False
+                )
+                pred_depth = None
+                gt_depth = None
             
-            losses = compute_loss(pred_points, gt_trajectories, initial_points)
+            losses = compute_loss(pred_points, gt_trajectories, initial_points, pred_depth, gt_depth)
             
             num_batches = accumulate_losses(total_losses, losses, num_batches)
             
@@ -171,6 +205,12 @@ def main():
                         help='Backbone architecture (default: resnet18)')
     parser.add_argument('--no_pretrained', action='store_true',
                         help='Disable pre-trained weights for backbone')
+    parser.add_argument('--max_temporal_len', type=int, default=1000,
+                        help='Maximum temporal length to support for learnable temporal tokens (default: 1000)')
+    parser.add_argument('--no_learnable_temporal', action='store_true',
+                        help='Disable learnable temporal tokens (use sinusoidal encoding instead)')
+    parser.add_argument('--use_depth', action='store_true',
+                        help='Enable depth prediction head (requires depth ground truth in dataset)')
     
     args = parser.parse_args()
     
@@ -227,7 +267,9 @@ def main():
         num_points=args.num_points,
         dropout=0.1,
         backbone=args.backbone,
-        pretrained=not args.no_pretrained
+        pretrained=not args.no_pretrained,
+        max_temporal_len=args.max_temporal_len,
+        use_learnable_temporal=not args.no_learnable_temporal
     ).to(device)
     
     print(f'Model parameters: {sum(p.numel() for p in model.parameters()):,}')
@@ -251,20 +293,27 @@ def main():
     writer = SummaryWriter(log_dir)
     
     print('Starting training...')
+    if args.use_depth:
+        print('Depth prediction enabled')
+    
     for epoch in range(start_epoch, args.epochs):
         train_losses = train_epoch(
-            model, train_loader, optimizer, device, epoch, writer, vis_dir
+            model, train_loader, optimizer, device, epoch, writer, vis_dir, use_depth=args.use_depth
         )
         loss_history['train'].append(train_losses['total_loss'])
         
-        val_losses = validate(model, val_loader, device, epoch, writer, vis_dir)
+        val_losses = validate(model, val_loader, device, epoch, writer, vis_dir, use_depth=args.use_depth)
         loss_history['val'].append(val_losses['total_loss'])
         
         scheduler.step()
         
         print(f'\nEpoch {epoch}:')
         print(f'  Train Loss: {train_losses["total_loss"]:.4f}, EPE: {train_losses["epe"]:.4f}')
+        if args.use_depth:
+            print(f'  Train Depth Loss: {train_losses["depth_loss"]:.4f}')
         print(f'  Val Loss: {val_losses["total_loss"]:.4f}, EPE: {val_losses["epe"]:.4f}')
+        if args.use_depth:
+            print(f'  Val Depth Loss: {val_losses["depth_loss"]:.4f}')
         
         checkpoint = {
             'epoch': epoch,

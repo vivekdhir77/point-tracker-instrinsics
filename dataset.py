@@ -34,14 +34,12 @@ class PointOdysseyDataset(Dataset):
         num_points=8,
         image_size=(256, 256),
         min_frames=20,
-        augment=True
     ):
         self.data_root = Path(data_root)
         self.sequence_length = sequence_length
         self.num_points = num_points
         self.image_size = image_size
         self.min_frames = min_frames
-        self.augment = augment
         
         if video_dirs is None:
             self.video_dirs = [d.name for d in self.data_root.iterdir() if d.is_dir()]
@@ -171,18 +169,6 @@ class PointOdysseyDataset(Dataset):
             
             gt_trajectories.append(normalized_coords)
             gt_visibilities.append(frame_visibs)
-        
-        num_selected = len(selected_indices)
-        if num_selected < self.num_points:
-            pad_size = self.num_points - num_selected
-            for t in range(len(gt_trajectories)):
-                pad_coords = np.ones((pad_size, 2), dtype=np.float32) * 0.5
-                gt_trajectories[t] = np.vstack([gt_trajectories[t], pad_coords])
-                pad_visibs = np.zeros(pad_size, dtype=np.bool_)
-                gt_visibilities[t] = np.hstack([gt_visibilities[t], pad_visibs])
-            
-            pad_coords = np.ones((pad_size, 2), dtype=np.float32) * 0.5
-            initial_points = np.vstack([initial_points, pad_coords])
         
         gt_trajectories = np.array(gt_trajectories, dtype=np.float32)  # (T, N, 2)
         gt_visibilities = np.array(gt_visibilities, dtype=np.float32)  # (T, N)
