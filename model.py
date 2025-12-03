@@ -820,6 +820,9 @@ class PointTracker(nn.Module):
         # Initialize frame-wise temporal tokens
         # If previous_temporal_tokens is provided (from previous windows), use them
         # Otherwise, start fresh. Each frame in current window gets its own temporal token.
+        # IMPORTANT: Store original previous tokens - they're frozen and should NOT be updated
+        original_previous_tokens = previous_temporal_tokens  # Keep original for later (frozen)
+        
         if previous_temporal_tokens is not None:
             T_prev = previous_temporal_tokens.shape[1]  # Number of previous frames
             # Create new temporal tokens for current window frames
@@ -962,15 +965,14 @@ class PointTracker(nn.Module):
             x_next_out = x[:, -N:, :]  # (B, N, hidden_dim) - last N tokens are the point tokens
             
             # Update temporal tokens - extract updated tokens from transformer output
-            # Update the current window's temporal tokens that were used
-            # Extract updated tokens: previous (if any) + updated history + updated next
+            # IMPORTANT: Previous temporal tokens are in the sequence for context (attention),
+            # but we DON'T update them - they're frozen and contain information from their frames
+            # Only update tokens for the current window frames
             if T_prev > 0:
-                # Previous tokens are at the beginning
-                updated_prev_tokens = x[:, :T_prev, :]  # (B, T_prev, hidden_dim)
+                # Previous tokens are in sequence for context, but we keep them unchanged
                 # Updated current window tokens start after previous tokens
                 updated_current_start = T_prev
             else:
-                updated_prev_tokens = None
                 updated_current_start = 0
             
             # Extract updated tokens for frames used in this iteration (history + next)
@@ -993,8 +995,11 @@ class PointTracker(nn.Module):
             updated_current_window_tokens[:, num_tracked_frames:num_tracked_frames+1, :] = updated_next_token
             
             # Reconstruct all_temporal_tokens
+            # IMPORTANT: Keep previous temporal tokens unchanged - they already contain information from their frames
+            # Only update tokens for the current window frames
             if T_prev > 0:
-                all_temporal_tokens = torch.cat([updated_prev_tokens, updated_current_window_tokens], dim=1)  # (B, T_prev + T, hidden_dim)
+                # Use original previous tokens, not updated ones (they're frozen)
+                all_temporal_tokens = torch.cat([original_previous_tokens, updated_current_window_tokens], dim=1)  # (B, T_prev + T, hidden_dim)
             else:
                 all_temporal_tokens = updated_current_window_tokens  # (B, T, hidden_dim)
             
@@ -1106,10 +1111,11 @@ class PointTracker(nn.Module):
         updated_current_temporal_tokens = torch.cat(updated_current_temporal_tokens, dim=1)  # (B, T, hidden_dim)
         
         # Combine previous + updated current temporal tokens
+        # IMPORTANT: Keep previous temporal tokens unchanged - they already contain information from their frames
+        # Previous tokens are in the sequence for context (so new tokens can attend to them), but we don't update them
         if T_prev > 0:
-            # Extract previous temporal tokens (they may have been updated too)
-            updated_prev_temporal_tokens = x[:, :T_prev, :]  # (B, T_prev, hidden_dim)
-            all_updated_temporal_tokens = torch.cat([updated_prev_temporal_tokens, updated_current_temporal_tokens], dim=1)  # (B, T_prev + T, hidden_dim)
+            # Use original previous tokens, not updated ones (they're frozen)
+            all_updated_temporal_tokens = torch.cat([original_previous_tokens, updated_current_temporal_tokens], dim=1)  # (B, T_prev + T, hidden_dim)
         else:
             all_updated_temporal_tokens = updated_current_temporal_tokens  # (B, T, hidden_dim)
         
