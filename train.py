@@ -234,11 +234,12 @@ def plot_detailed_losses(epoch_losses_history, batch_losses_history, save_path):
         ax.legend()
         ax.grid(True, alpha=0.3)
     
-    # Plot 3: Ray Loss Components
+    # Plot 3: Ray Loss or Visibility Loss
     ax = axes[0, 2]
     if 'train' in epoch_losses_history and len(epoch_losses_history['train']) > 0:
         epochs = range(len(epoch_losses_history['train']))
-        if 'ray_loss' in epoch_losses_history['train'][0]:
+        # Prioritize ray loss if available, otherwise show visibility loss
+        if 'ray_loss' in epoch_losses_history['train'][0] and epoch_losses_history['train'][0]['ray_loss'] > 0:
             train_ray = [losses_dict['ray_loss'] for losses_dict in epoch_losses_history['train']]
             val_ray = [losses_dict['ray_loss'] for losses_dict in epoch_losses_history['val']]
             ax.plot(epochs, train_ray, 'b-', label='Train Ray', linewidth=2)
@@ -248,26 +249,49 @@ def plot_detailed_losses(epoch_losses_history, batch_losses_history, save_path):
             ax.set_title('Ray Loss per Epoch')
             ax.legend()
             ax.grid(True, alpha=0.3)
+        elif 'visibility_loss' in epoch_losses_history['train'][0] and epoch_losses_history['train'][0]['visibility_loss'] > 0:
+            train_vis = [losses_dict.get('visibility_loss', 0) for losses_dict in epoch_losses_history['train']]
+            val_vis = [losses_dict.get('visibility_loss', 0) for losses_dict in epoch_losses_history['val']]
+            ax.plot(epochs, train_vis, 'b-', label='Train Visibility', linewidth=2)
+            ax.plot(epochs, val_vis, 'r-', label='Val Visibility', linewidth=2)
+            ax.set_xlabel('Epoch')
+            ax.set_ylabel('Visibility Loss')
+            ax.set_title('Visibility Loss per Epoch')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
         else:
-            ax.text(0.5, 0.5, 'Ray loss not enabled', ha='center', va='center')
-            ax.set_title('Ray Loss (Not Enabled)')
+            ax.text(0.5, 0.5, 'Ray/Visibility loss not enabled', ha='center', va='center')
+            ax.set_title('Ray/Visibility Loss (Not Enabled)')
     
-    # Plot 4: Per-Batch Total Loss (shows training dynamics)
+    # Plot 4: Per-Batch Total Loss and Visibility Loss (shows training dynamics)
     ax = axes[1, 0]
     if 'total_loss' in batch_losses_history and len(batch_losses_history['total_loss']) > 0:
         batches = range(len(batch_losses_history['total_loss']))
-        ax.plot(batches, batch_losses_history['total_loss'], 'b-', alpha=0.6, linewidth=0.5)
-        # Add moving average
+        ax.plot(batches, batch_losses_history['total_loss'], 'b-', alpha=0.6, linewidth=0.5, label='Total Loss')
+        
+        # Add visibility loss if available
+        if 'visibility_loss' in batch_losses_history and len(batch_losses_history['visibility_loss']) > 0:
+            # Check if visibility loss is non-zero
+            if max(batch_losses_history['visibility_loss']) > 0:
+                ax2 = ax.twinx()  # Create second y-axis for visibility loss
+                ax2.plot(batches, batch_losses_history['visibility_loss'], 'r-', alpha=0.4, linewidth=0.5, label='Visibility Loss')
+                ax2.set_ylabel('Visibility Loss', color='r')
+                ax2.tick_params(axis='y', labelcolor='r')
+                ax2.legend(loc='upper right')
+        
+        # Add moving average for total loss
         window = min(50, len(batch_losses_history['total_loss']) // 10)
         if window > 1:
             moving_avg = np.convolve(batch_losses_history['total_loss'], 
                                     np.ones(window)/window, mode='valid')
             ax.plot(range(window-1, len(batch_losses_history['total_loss'])), 
-                   moving_avg, 'r-', linewidth=2, label=f'Moving Avg ({window})')
-            ax.legend()
+                   moving_avg, 'b--', linewidth=2, label=f'Moving Avg ({window})')
+        
         ax.set_xlabel('Batch')
-        ax.set_ylabel('Total Loss')
-        ax.set_title('Per-Batch Total Loss')
+        ax.set_ylabel('Total Loss', color='b')
+        ax.tick_params(axis='y', labelcolor='b')
+        ax.set_title('Per-Batch Total Loss (+ Visibility)')
+        ax.legend(loc='upper left')
         ax.grid(True, alpha=0.3)
     
     # Plot 5: Direction vs Moment Loss
@@ -285,7 +309,7 @@ def plot_detailed_losses(epoch_losses_history, batch_losses_history, save_path):
         ax.text(0.5, 0.5, 'Ray components not available', ha='center', va='center')
         ax.set_title('Ray Components (Not Enabled)')
     
-    # Plot 6: L1 vs Temporal Loss
+    # Plot 6: L1 vs Temporal vs Visibility Loss
     ax = axes[1, 2]
     if 'train' in epoch_losses_history and len(epoch_losses_history['train']) > 0:
         epochs = range(len(epoch_losses_history['train']))
@@ -293,6 +317,13 @@ def plot_detailed_losses(epoch_losses_history, batch_losses_history, save_path):
         train_temporal = [losses_dict['temporal_loss'] for losses_dict in epoch_losses_history['train']]
         ax.plot(epochs, train_l1, 'b-', label='L1', linewidth=2)
         ax.plot(epochs, train_temporal, 'g-', label='Temporal', linewidth=2)
+        
+        # Add visibility loss if available
+        if 'visibility_loss' in epoch_losses_history['train'][0]:
+            train_visibility = [losses_dict.get('visibility_loss', 0) for losses_dict in epoch_losses_history['train']]
+            if max(train_visibility) > 0:  # Only plot if visibility loss is non-zero
+                ax.plot(epochs, train_visibility, 'r-', label='Visibility', linewidth=2)
+        
         ax.set_xlabel('Epoch')
         ax.set_ylabel('Loss')
         ax.set_title('Loss Components per Epoch')
