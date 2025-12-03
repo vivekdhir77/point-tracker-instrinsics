@@ -532,10 +532,8 @@ def main():
                         help='Backbone architecture (default: resnet18)')
     parser.add_argument('--no_pretrained', action='store_true',
                         help='Disable pre-trained weights for backbone')
-    parser.add_argument('--use_correlation_matching', action='store_true', default=True,
-                        help='Enable correlation-based feature matching (default: True)')
     parser.add_argument('--search_radius', type=int, default=4,
-                        help='Search radius for correlation matching (default: 4)')
+                        help='Search radius for cosine similarity matching (default: 4)')
     parser.add_argument('--use_rays', action='store_true',
                         help='Enable ray prediction (Plücker coordinates) - implicitly supervises camera parameters')
     parser.add_argument('--lambda_ray', type=float, default=0.1,
@@ -598,7 +596,6 @@ def main():
         dropout=0.1,
         backbone=args.backbone,
         pretrained=not args.no_pretrained,
-        use_correlation_matching=args.use_correlation_matching,
         search_radius=args.search_radius
     ).to(device)
     
